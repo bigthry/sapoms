@@ -11,6 +11,7 @@ import Footer from "@/components/Footer";
 import Link from "next/link";
 import axios from "axios";
 // import { getRecentlyViewed, pushRecentlyViewed, type RecentlyViewedItem } from "@/components/Header";
+import DashboardPage from "@/components/terms&conditions";
 
 import { getRecentlyViewed, pushRecentlyViewed, type RecentlyViewedItem } from "@/components/Header";
 
@@ -439,9 +440,6 @@ export default function Page() {
         </section>
       )}
 
-      {/* ══════════════════════════════════════════════════════════════════
-          SECTION 5 — Hot Right Now
-      ══════════════════════════════════════════════════════════════════ */}
       <section id="hot-right-now" className="max-w-[1400px] mx-auto px-4 py-12 border-t border-gray-200">
         <SectionHeading
           title="Hot Right Now"

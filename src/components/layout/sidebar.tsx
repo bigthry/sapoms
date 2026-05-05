@@ -6,36 +6,44 @@ import { useState, useEffect } from "react";
 import {
   LayoutDashboard, UserRoundPlus, Users, SquareUser,
   Plus, ClipboardList, Home, LogOut, Package, Images,
+  UserCircle,
 } from "lucide-react";
+import { CiGift } from "react-icons/ci";
 
 type Role    = "admin" | "dealer" | "staff";
 type NavItem = { label: string; href: string; icon: React.ReactNode; section?: string };
 
 const NAV: Record<Role, NavItem[]> = {
   admin: [
-    { section: "Overview",  label: "Dashboard",     href: "/dashboard/admin",                          icon: <LayoutDashboard size={15} /> },
-    { section: "Dealers",   label: "Dealer List",   href: "/dashboard/admin/dealer/DealerList",        icon: <Users size={15} />           },
-    {                       label: "Add Dealer",     href: "/dashboard/admin/dealer/AddDealerForm",     icon: <UserRoundPlus size={15} />   },
-    { section: "Staff",     label: "Staff List",    href: "/dashboard/admin/staff/stafflist",          icon: <Users size={15} />           },
-    {                       label: "Add Staff",      href: "/dashboard/admin/staff/addstaff",           icon: <SquareUser size={15} />      },
-    { section: "Products",  label: "Products",      href: "/Pages/products",                           icon: <Package size={15} />         },
-    {                       label: "Add Product",    href: "/Pages/products/addproducts",               icon: <Plus size={15} />            },
-    { section: "Orders",    label: "Order List",    href: "/Pages/Ordermanagement",                    icon: <ClipboardList size={15} />   },
-    {                       label: "Pending Orders", href: "/Pages/Ordermanagement/outstandingorders",  icon: <ClipboardList size={15} />   },
-    { section: "Content",   label: "Slider Images", href: "/dashboard/admin/slider",                   icon: <Images size={15} />          },
-    { section: "Content",   label: "Hot Items", href: "/dashboard/admin/hot-items",                   icon: <Images size={15} />          },
+    { section: "Account",   label: "My Profile",     href: "/profile",                                 icon: <UserCircle size={15} />      },
+    { section: "Overview",  label: "Dashboard",      href: "/dashboard/admin",                         icon: <LayoutDashboard size={15} /> },
+    { section: "Dealers",   label: "Dealer List",    href: "/dashboard/admin/dealer/DealerList",       icon: <Users size={15} />           },
+    {                       label: "Add Dealer",      href: "/dashboard/admin/dealer/AddDealerForm",    icon: <UserRoundPlus size={15} />   },
+    { section: "Staff",     label: "Staff List",     href: "/dashboard/admin/staff/stafflist",         icon: <Users size={15} />           },
+    {                       label: "Add Staff",       href: "/dashboard/admin/staff/addstaff",          icon: <SquareUser size={15} />      },
+      { section: "accountant",     label: "add accountant",     href: "/dashboard/admin/manageAccountants/add-account",         icon: <Users size={15} />           },
+    
+    { section: "Products",  label: "Products",       href: "/Pages/products",                          icon: <Package size={15} />         },
+    {                       label: "Add Product",     href: "/Pages/products/addproducts",              icon: <Plus size={15} />            },
+    { section: "Orders",    label: "Order List",     href: "/Pages/Ordermanagement",                   icon: <ClipboardList size={15} />   },
+    {                       label: "Pending Orders",  href: "/Pages/Ordermanagement/outstandingorders", icon: <ClipboardList size={15} />   },
+    { section: "Content",   label: "Slider Images",  href: "/dashboard/admin/slider",                  icon: <Images size={15} />          },
+    {                       label: "Hot Items",       href: "/dashboard/admin/hot-items",               icon: <Images size={15} />          },
+    { section: "rewards", label: "rewards", href: "/dashboard/admin/rewards", icon:<CiGift /> },
   ],
   dealer: [
-    { section: "Home",     label: "Dashboard", href: "/dashboard/dealer",      icon: <Home size={15} />          },
-    { section: "Orders",   label: "My Order Status", href: "/Pages/Ordermanagement", icon: <ClipboardList size={15} /> },
-    { section: "Orders",   label: "My Order history", href: "/orders", icon: <ClipboardList size={15} /> },
-    {                      label: "Add Order",  href: "/dashboard/dealer/AddOrderForm",    icon: <Plus size={15} />          },
-    { section: "Products", label: "Products",  href: "/Pages/products",        icon: <Package size={15} />       },
+    { section: "Home",     label: "Dashboard",       href: "/dashboard/dealer",             icon: <Home size={15} />          },
+    { section: "Orders",   label: "My Order Status", href: "/Pages/Ordermanagement",        icon: <ClipboardList size={15} /> },
+    {                      label: "My Order History", href: "/orders",                       icon: <ClipboardList size={15} /> },
+    {                      label: "Add Order",        href: "/dashboard/dealer/AddOrderForm",icon: <Plus size={15} />          },
+    { section: "Products", label: "Products",        href: "/Pages/products",               icon: <Package size={15} />       },
+    { section: "Account",  label: "My Profile",      href: "/profile",                      icon: <UserCircle size={15} />    },
   ],
   staff: [
-    { section: "Overview", label: "Dashboard",     href: "/dashboard/staff",                          icon: <LayoutDashboard size={15} /> },
-    { section: "Orders",   label: "Order List",    href: "/Pages/Ordermanagement",                    icon: <ClipboardList size={15} />   },
-    {                      label: "Pending Orders", href: "/Pages/Ordermanagement/outstandingorders",  icon: <ClipboardList size={15} />   },
+    { section: "Overview", label: "Dashboard",      href: "/dashboard/staff",                          icon: <LayoutDashboard size={15} /> },
+    { section: "Orders",   label: "Order List",     href: "/Pages/Ordermanagement",                    icon: <ClipboardList size={15} />   },
+    {                      label: "Pending Orders",  href: "/Pages/Ordermanagement/outstandingorders",  icon: <ClipboardList size={15} />   },
+    { section: "Account",  label: "My Profile",     href: "/profile",                                  icon: <UserCircle size={15} />      },
   ],
 };
 
@@ -109,6 +117,8 @@ export default function Sidebar({ open, onClose }: { open: boolean; onClose: () 
     }
   });
 
+  const isProfileActive = pathname === "/profile";
+
   return (
     <>
       <style>{`
@@ -136,12 +146,25 @@ export default function Sidebar({ open, onClose }: { open: boolean; onClose: () 
         .sb-chip { display: inline-flex; align-items: center; padding: 3px 10px; border-radius: 20px; background: rgba(99,102,241,0.16); color: #818cf8; font-size: 10px; font-weight: 600; letter-spacing: .1em; text-transform: uppercase; margin-bottom: 10px; }
         .sb-title { font-size: 17px; font-weight: 600; color: #fff; letter-spacing: -.3px; }
 
-        /* User card */
-        .sb-user { margin: 14px 14px 0; padding: 14px; background: rgba(255,255,255,0.04); border: 1px solid rgba(255,255,255,0.08); border-radius: 14px; }
+        /* User card — now also a link to profile */
+        .sb-user {
+          margin: 14px 14px 0; padding: 14px;
+          background: rgba(255,255,255,0.04);
+          border: 1px solid rgba(255,255,255,0.08);
+          border-radius: 14px;
+          text-decoration: none; display: block;
+          transition: background .18s, border-color .18s;
+          cursor: pointer;
+        }
+        .sb-user:hover { background: rgba(255,255,255,0.07); border-color: rgba(99,102,241,0.25); }
+        .sb-user.profile-active { border-color: rgba(99,102,241,0.4); background: rgba(99,102,241,0.06); }
         .sb-avatar { width: 36px; height: 36px; border-radius: 50%; background: linear-gradient(135deg,#6366f1,#a78bfa); display: flex; align-items: center; justify-content: center; font-size: 14px; font-weight: 700; color: #fff; margin-bottom: 8px; }
         .sb-uname { font-size: 13px; font-weight: 600; color: #f1f5f9; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
         .sb-meta  { font-size: 10.5px; color: #475569; margin-top: 2px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
         .sb-role  { margin-top: 6px; display: inline-block; font-size: 10px; font-family: monospace; background: rgba(99,102,241,0.18); color: #a5b4fc; padding: 2px 8px; border-radius: 6px; }
+        .sb-edit-hint { font-size: 10px; color: #334155; margin-top: 6px; display: flex; align-items: center; gap: 4px; }
+        .sb-user:hover .sb-edit-hint { color: #6366f1; }
+        .sb-user.profile-active .sb-edit-hint { color: #818cf8; }
 
         /* Nav */
         .sb-nav { flex: 1; padding: 10px; margin-top: 10px; overflow-y: auto; }
@@ -178,8 +201,12 @@ export default function Sidebar({ open, onClose }: { open: boolean; onClose: () 
           <div className="sb-title">Workspace</div>
         </div>
 
-        {/* User card */}
-        <div className="sb-user">
+        {/* User card — click goes to /profile */}
+        <Link
+          href="/profile"
+          onClick={onClose}
+          className={`sb-user${isProfileActive ? " profile-active" : ""}`}
+        >
           <div className="sb-avatar">
             {mounted ? getInitials(name) : "…"}
           </div>
@@ -192,7 +219,10 @@ export default function Sidebar({ open, onClose }: { open: boolean; onClose: () 
           {mounted && badge && (
             <span className="sb-role">{badge}</span>
           )}
-        </div>
+          <div className="sb-edit-hint">
+            <UserCircle size={10} /> Edit profile
+          </div>
+        </Link>
 
         {/* Nav */}
         <nav className="sb-nav">

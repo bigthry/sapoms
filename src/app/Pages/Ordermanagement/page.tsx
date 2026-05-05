@@ -4,6 +4,7 @@ import { useState, useEffect, useCallback, useRef } from 'react'
 import { useQuery, useQueryClient, keepPreviousData } from '@tanstack/react-query'
 import { useRouter } from 'next/navigation'
 import axios from 'axios'
+import * as XLSX from 'xlsx'
 
 type Role = 'admin' | 'dealer' | 'staff'
 type UserSession = { role: Role; id: string; name: string; roletype?: string; viewRoute: string }
@@ -23,6 +24,7 @@ const YEAR           = new Date().getFullYear()
 const ROLE_CONFIG: Record<Role, {
   label: string; pillCls: string; caption: string
   endpoint: (id: string, page: number, search: string) => string
+  allPagesEndpoint: (id: string, search: string) => string
   showDealerCol: boolean; showActions: boolean
   canDelete: (s: UserSession, row: OrderData) => boolean
   canAccept: (s: UserSession, row: OrderData) => boolean
@@ -32,6 +34,8 @@ const ROLE_CONFIG: Record<Role, {
     label: 'Admin', pillCls: 'role-admin', caption: 'All dealer orders across the system',
     endpoint: (_id, page, search) =>
       `${BACKEND_URL}/orderpegination?page=${page}&limit=${ITEMS_PER_PAGE}&search=${search}`,
+    allPagesEndpoint: (_id, search) =>
+      `${BACKEND_URL}/orderpegination?page=1&limit=99999&search=${search}`,
     showDealerCol: true, showActions: true,
     canDelete: (_s, row) => row.accept_order === '0' && row.del_status === '0',
     canAccept: () => false,
@@ -41,6 +45,8 @@ const ROLE_CONFIG: Record<Role, {
     label: 'Dealer', pillCls: 'role-dealer', caption: 'Your order history',
     endpoint: (id, page, search) =>
       `${BACKEND_URL}/orderhispegination?page=${page}&limit=${ITEMS_PER_PAGE}&search=${search}&id=${id}`,
+    allPagesEndpoint: (id, search) =>
+      `${BACKEND_URL}/orderhispegination?page=1&limit=99999&search=${search}&id=${id}`,
     showDealerCol: false, showActions: true,
     canDelete: (_s, row) => row.accept_order === '0' && row.del_status === '0',
     canAccept: () => false,
@@ -50,6 +56,8 @@ const ROLE_CONFIG: Record<Role, {
     label: 'Staff', pillCls: 'role-staff', caption: 'Orders assigned to you',
     endpoint: (id, page, search) =>
       `${BACKEND_URL}/staffOrderrPagination?page=${page}&limit=${ITEMS_PER_PAGE}&search=${search}&id=${id}`,
+    allPagesEndpoint: (id, search) =>
+      `${BACKEND_URL}/staffOrderrPagination?page=1&limit=99999&search=${search}&id=${id}`,
     showDealerCol: true, showActions: true,
     canDelete: () => false,
     canAccept: (s, row) => s.roletype !== '2' && row.del_status === '0',
@@ -87,6 +95,72 @@ function resolveSession(): UserSession | null {
     }
   } catch (_) {}
   return null
+}
+
+// ─── Excel Export ─────────────────────────────────────────────────────────────
+function ordersToSheetRows(orders: OrderData[], showDealer: boolean) {
+  return orders.map((o, i) => {
+    const row: Record<string, string | number> = {
+      '#':             i + 1,
+      'Order ID':      `OM/${YEAR}/${o.order_id}`,
+      'Order Date':    (o.orderDate || o.order_date || '').slice(0, 10),
+      'Due Date':      o.outstandingDate || '',
+      'Amount (₹)':    Number(o.order_amount || 0),
+      'Discount (₹)':  Number(o.order_discount || 0),
+      'Ordered Qty':           o.orderdata_item_quantity || '',
+      'Despatched Qty':     o.readyquantity || '',
+      'Confirmation':  o.accept_order === '1' ? 'Accepted' : 'Awaiting',
+      
+      'Del Status':    o.del_status === '1' ? 'Deleted' : 'Active',
+      'Reason':        o.reason || '',
+    }
+    if (showDealer) {
+      row['Dealer Name'] = o.Dealer_Name || ''
+      row['Dealer ID']   = o.order_dealer || ''
+    }
+    return row
+  })
+}
+
+function exportToExcel(orders: OrderData[], filename: string, showDealer: boolean) {
+  const rows = ordersToSheetRows(orders, showDealer)
+  const ws   = XLSX.utils.json_to_sheet(rows)
+
+  // Column widths
+  const colWidths = [
+    { wch: 5 }, { wch: 20 }, { wch: 14 }, { wch: 14 },
+    { wch: 14 }, { wch: 14 }, { wch: 8 }, { wch: 10 },
+    { wch: 14 }, { wch: 14 }, { wch: 12 }, { wch: 30 },
+    ...(showDealer ? [{ wch: 22 }, { wch: 12 }] : []),
+  ]
+  ws['!cols'] = colWidths
+
+  const wb = XLSX.utils.book_new()
+  XLSX.utils.book_append_sheet(wb, ws, 'Orders')
+
+  // Summary sheet
+  const accepted  = orders.filter(o => o.accept_order === '1').length
+  const awaiting  = orders.filter(o => o.accept_order === '0').length
+  const completed = orders.filter(o => o.mtstatus === 'Completed').length
+  const inProcess = orders.filter(o => o.mtstatus === 'InProcess').length
+  const pending   = orders.filter(o => !o.mtstatus || o.mtstatus === 'Pending').length
+  const totalAmt  = orders.reduce((s, o) => s + Number(o.order_amount || 0), 0)
+
+  const summaryRows = [
+    { 'Metric': 'Total Orders',    'Value': orders.length },
+    { 'Metric': 'Accepted',        'Value': accepted },
+    { 'Metric': 'Awaiting',        'Value': awaiting },
+    { 'Metric': 'MT Completed',    'Value': completed },
+    { 'Metric': 'MT In Process',   'Value': inProcess },
+    { 'Metric': 'MT Pending',      'Value': pending },
+    { 'Metric': 'Total Amount (₹)','Value': totalAmt },
+    { 'Metric': 'Exported At',     'Value': new Date().toLocaleString('en-IN') },
+  ]
+  const ws2 = XLSX.utils.json_to_sheet(summaryRows)
+  ws2['!cols'] = [{ wch: 22 }, { wch: 20 }]
+  XLSX.utils.book_append_sheet(wb, ws2, 'Summary')
+
+  XLSX.writeFile(wb, `${filename}.xlsx`)
 }
 
 // ─── Helpers ──────────────────────────────────────────────────────────────────
@@ -134,10 +208,48 @@ function FilterTag({ label, color, bg, onRemove }: {
   )
 }
 
+// ─── ExportButton ─────────────────────────────────────────────────────────────
+function ExportButton({
+  label, sublabel, icon, color, bg, border, hoverBg,
+  loading, onClick,
+}: {
+  label: string; sublabel?: string; icon: React.ReactNode
+  color: string; bg: string; border: string; hoverBg: string
+  loading?: boolean; onClick: () => void
+}) {
+  const [hovered, setHovered] = useState(false)
+  return (
+    <button
+      onClick={onClick}
+      disabled={loading}
+      onMouseEnter={() => setHovered(true)}
+      onMouseLeave={() => setHovered(false)}
+      style={{
+        display: 'inline-flex', alignItems: 'center', gap: 7,
+        padding: sublabel ? '6px 13px 6px 10px' : '6px 13px 6px 10px',
+        borderRadius: 9, border: `1px solid ${border}`,
+        background: hovered && !loading ? hoverBg : bg,
+        color, fontSize: 12.5, fontWeight: 600, cursor: loading ? 'wait' : 'pointer',
+        fontFamily: 'inherit', transition: 'all 0.15s', opacity: loading ? 0.7 : 1,
+        whiteSpace: 'nowrap',
+      }}
+    >
+      {loading
+        ? <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" style={{ animation: 'spin 0.8s linear infinite' }}><path d="M12 2v4M12 18v4M4.93 4.93l2.83 2.83M16.24 16.24l2.83 2.83M2 12h4M18 12h4M4.93 19.07l2.83-2.83M16.24 7.76l2.83-2.83" /></svg>
+        : icon
+      }
+      <span>
+        <div style={{ lineHeight: 1.2 }}>{label}</div>
+        {sublabel && <div style={{ fontSize: 10, fontWeight: 400, opacity: 0.75, marginTop: 1 }}>{sublabel}</div>}
+      </span>
+    </button>
+  )
+}
+
 // ─── ActionMenu ───────────────────────────────────────────────────────────────
-function ActionMenu({ showDelete, showAccept, acceptOrder, onView, onAccept, onDecline, onDelete }: {
+function ActionMenu({ showDelete, showAccept, acceptOrder, onView, onAccept, onDecline, onDelete, onExport }: {
   showDelete: boolean; showAccept: boolean; acceptOrder: string
-  onView: () => void; onAccept: () => void; onDecline: () => void; onDelete: () => void
+  onView: () => void; onAccept: () => void; onDecline: () => void; onDelete: () => void; onExport: () => void
 }) {
   const [open, setOpen] = useState(false)
   const ref = useRef<HTMLDivElement>(null)
@@ -174,35 +286,16 @@ function ActionMenu({ showDelete, showAccept, acceptOrder, onView, onAccept, onD
       {open && (
         <div style={{
           position: 'absolute', right: 0, top: 'calc(100% + 8px)', zIndex: 50,
-          minWidth: 176,
-          background: '#fff',
-          border: '1px solid #e2e8f0',
-          borderRadius: 12,
-          boxShadow: '0 8px 24px rgba(0,0,0,0.10), 0 2px 8px rgba(0,0,0,0.06)',
-          padding: '6px',
-          display: 'flex', flexDirection: 'column', gap: 2,
+          minWidth: 176, background: '#fff', border: '1px solid #e2e8f0',
+          borderRadius: 12, boxShadow: '0 8px 24px rgba(0,0,0,0.10), 0 2px 8px rgba(0,0,0,0.06)',
+          padding: '6px', display: 'flex', flexDirection: 'column', gap: 2,
         }}>
 
           {/* View */}
-          <button
-            onClick={close(onView)}
-            style={{
-              display: 'flex', alignItems: 'center', gap: 10,
-              width: '100%', padding: '9px 12px',
-              borderRadius: 8, border: 'none',
-              background: 'transparent', cursor: 'pointer',
-              fontSize: 12.5, fontWeight: 500, color: '#374151',
-              fontFamily: 'inherit', textAlign: 'left',
-              transition: 'background 0.12s',
-            }}
+          <button onClick={close(onView)} style={menuItemStyle('#374151')}
             onMouseEnter={e => (e.currentTarget.style.background = '#f8fafc')}
-            onMouseLeave={e => (e.currentTarget.style.background = 'transparent')}
-          >
-            <span style={{
-              width: 28, height: 28, borderRadius: 7,
-              background: '#f1f5f9', border: '1px solid #e2e8f0',
-              display: 'flex', alignItems: 'center', justifyContent: 'center', flexShrink: 0,
-            }}>
+            onMouseLeave={e => (e.currentTarget.style.background = 'transparent')}>
+            <span style={iconBoxStyle('#f1f5f9', '#e2e8f0')}>
               <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="#475569" strokeWidth="2" strokeLinecap="round">
                 <path d="M1 12s4-8 11-8 11 8 11 8-4 8-11 8-11-8-11-8z" /><circle cx="12" cy="12" r="3" />
               </svg>
@@ -213,30 +306,29 @@ function ActionMenu({ showDelete, showAccept, acceptOrder, onView, onAccept, onD
             </span>
           </button>
 
+          {/* Export single order */}
+          <button onClick={close(onExport)} style={menuItemStyle('#065f46')}
+            onMouseEnter={e => (e.currentTarget.style.background = '#f0fdf4')}
+            onMouseLeave={e => (e.currentTarget.style.background = 'transparent')}>
+            <span style={iconBoxStyle('#dcfce7', '#bbf7d0')}>
+              <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="#16a34a" strokeWidth="2" strokeLinecap="round">
+                <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4" />
+                <polyline points="7 10 12 15 17 10" /><line x1="12" y1="15" x2="12" y2="3" />
+              </svg>
+            </span>
+            <span>
+              <div style={{ lineHeight: 1.2 }}>Export Order</div>
+              <div style={{ fontSize: 10.5, color: '#86efac', marginTop: 2 }}>Download as Excel</div>
+            </span>
+          </button>
+
           {/* Accept */}
           {showAccept && acceptOrder === '0' && (
-            <button
-              onClick={close(onAccept)}
-              style={{
-                display: 'flex', alignItems: 'center', gap: 10,
-                width: '100%', padding: '9px 12px',
-                borderRadius: 8, border: 'none',
-                background: 'transparent', cursor: 'pointer',
-                fontSize: 12.5, fontWeight: 500, color: '#065f46',
-                fontFamily: 'inherit', textAlign: 'left',
-                transition: 'background 0.12s',
-              }}
+            <button onClick={close(onAccept)} style={menuItemStyle('#065f46')}
               onMouseEnter={e => (e.currentTarget.style.background = '#f0fdf4')}
-              onMouseLeave={e => (e.currentTarget.style.background = 'transparent')}
-            >
-              <span style={{
-                width: 28, height: 28, borderRadius: 7,
-                background: '#dcfce7', border: '1px solid #bbf7d0',
-                display: 'flex', alignItems: 'center', justifyContent: 'center', flexShrink: 0,
-              }}>
-                <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="#16a34a" strokeWidth="2.5" strokeLinecap="round">
-                  <path d="M20 6 9 17l-5-5" />
-                </svg>
+              onMouseLeave={e => (e.currentTarget.style.background = 'transparent')}>
+              <span style={iconBoxStyle('#dcfce7', '#bbf7d0')}>
+                <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="#16a34a" strokeWidth="2.5" strokeLinecap="round"><path d="M20 6 9 17l-5-5" /></svg>
               </span>
               <span>
                 <div style={{ lineHeight: 1.2 }}>Accept Order</div>
@@ -245,50 +337,23 @@ function ActionMenu({ showDelete, showAccept, acceptOrder, onView, onAccept, onD
             </button>
           )}
 
-          {/* Already accepted → show disabled + decline */}
+          {/* Already accepted → decline */}
           {showAccept && acceptOrder === '1' && (
             <>
-              <div style={{
-                display: 'flex', alignItems: 'center', gap: 10,
-                padding: '9px 12px', borderRadius: 8,
-                fontSize: 12.5, fontWeight: 500, color: '#6ee7b7', opacity: 0.7,
-              }}>
-                <span style={{
-                  width: 28, height: 28, borderRadius: 7,
-                  background: '#f0fdf4', border: '1px solid #bbf7d0',
-                  display: 'flex', alignItems: 'center', justifyContent: 'center', flexShrink: 0,
-                }}>
-                  <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="#16a34a" strokeWidth="2.5" strokeLinecap="round">
-                    <path d="M20 6 9 17l-5-5" />
-                  </svg>
+              <div style={{ display: 'flex', alignItems: 'center', gap: 10, padding: '9px 12px', borderRadius: 8, fontSize: 12.5, fontWeight: 500, color: '#6ee7b7', opacity: 0.7 }}>
+                <span style={iconBoxStyle('#f0fdf4', '#bbf7d0')}>
+                  <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="#16a34a" strokeWidth="2.5" strokeLinecap="round"><path d="M20 6 9 17l-5-5" /></svg>
                 </span>
                 <span>
                   <div style={{ lineHeight: 1.2, color: '#065f46' }}>Accepted</div>
                   <div style={{ fontSize: 10.5, color: '#a7f3d0', marginTop: 2 }}>Already confirmed</div>
                 </span>
               </div>
-              <button
-                onClick={close(onDecline)}
-                style={{
-                  display: 'flex', alignItems: 'center', gap: 10,
-                  width: '100%', padding: '9px 12px',
-                  borderRadius: 8, border: 'none',
-                  background: 'transparent', cursor: 'pointer',
-                  fontSize: 12.5, fontWeight: 500, color: '#be123c',
-                  fontFamily: 'inherit', textAlign: 'left',
-                  transition: 'background 0.12s',
-                }}
+              <button onClick={close(onDecline)} style={menuItemStyle('#be123c')}
                 onMouseEnter={e => (e.currentTarget.style.background = '#fff1f2')}
-                onMouseLeave={e => (e.currentTarget.style.background = 'transparent')}
-              >
-                <span style={{
-                  width: 28, height: 28, borderRadius: 7,
-                  background: '#fff1f2', border: '1px solid #fecdd3',
-                  display: 'flex', alignItems: 'center', justifyContent: 'center', flexShrink: 0,
-                }}>
-                  <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="#be123c" strokeWidth="2.5" strokeLinecap="round">
-                    <path d="M18 6 6 18M6 6l12 12" />
-                  </svg>
+                onMouseLeave={e => (e.currentTarget.style.background = 'transparent')}>
+                <span style={iconBoxStyle('#fff1f2', '#fecdd3')}>
+                  <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="#be123c" strokeWidth="2.5" strokeLinecap="round"><path d="M18 6 6 18M6 6l12 12" /></svg>
                 </span>
                 <span>
                   <div style={{ lineHeight: 1.2 }}>Decline</div>
@@ -298,29 +363,14 @@ function ActionMenu({ showDelete, showAccept, acceptOrder, onView, onAccept, onD
             </>
           )}
 
-          {/* Divider + Delete */}
+          {/* Delete */}
           {showDelete && (
             <>
               <div style={{ height: 1, background: '#f1f5f9', margin: '2px 4px' }} />
-              <button
-                onClick={close(onDelete)}
-                style={{
-                  display: 'flex', alignItems: 'center', gap: 10,
-                  width: '100%', padding: '9px 12px',
-                  borderRadius: 8, border: 'none',
-                  background: 'transparent', cursor: 'pointer',
-                  fontSize: 12.5, fontWeight: 500, color: '#be123c',
-                  fontFamily: 'inherit', textAlign: 'left',
-                  transition: 'background 0.12s',
-                }}
+              <button onClick={close(onDelete)} style={menuItemStyle('#be123c')}
                 onMouseEnter={e => (e.currentTarget.style.background = '#fff1f2')}
-                onMouseLeave={e => (e.currentTarget.style.background = 'transparent')}
-              >
-                <span style={{
-                  width: 28, height: 28, borderRadius: 7,
-                  background: '#fff1f2', border: '1px solid #fecdd3',
-                  display: 'flex', alignItems: 'center', justifyContent: 'center', flexShrink: 0,
-                }}>
+                onMouseLeave={e => (e.currentTarget.style.background = 'transparent')}>
+                <span style={iconBoxStyle('#fff1f2', '#fecdd3')}>
                   <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="#be123c" strokeWidth="2" strokeLinecap="round">
                     <polyline points="3 6 5 6 21 6" /><path d="M19 6l-1 14H6L5 6m5 0V4h4v2" />
                   </svg>
@@ -338,22 +388,40 @@ function ActionMenu({ showDelete, showAccept, acceptOrder, onView, onAccept, onD
   )
 }
 
+function menuItemStyle(color: string): React.CSSProperties {
+  return {
+    display: 'flex', alignItems: 'center', gap: 10,
+    width: '100%', padding: '9px 12px', borderRadius: 8, border: 'none',
+    background: 'transparent', cursor: 'pointer',
+    fontSize: 12.5, fontWeight: 500, color,
+    fontFamily: 'inherit', textAlign: 'left', transition: 'background 0.12s',
+  }
+}
+function iconBoxStyle(bg: string, border: string): React.CSSProperties {
+  return {
+    width: 28, height: 28, borderRadius: 7, background: bg, border: `1px solid ${border}`,
+    display: 'flex', alignItems: 'center', justifyContent: 'center', flexShrink: 0,
+  }
+}
+
 // ─── Main Page ────────────────────────────────────────────────────────────────
 export default function OrdersPage() {
   const router      = useRouter()
   const queryClient = useQueryClient()
 
-  const [session,      setSession     ] = useState<UserSession | null>(null)
-  const [page,         setPage        ] = useState(1)
-  const [toast,        setToast       ] = useState<{ msg: string; type: 'ok' | 'err' } | null>(null)
-  const [orderIdInput, setOrderIdInput] = useState('')
-  const [dealerInput,  setDealerInput ] = useState('')
-  const [statusSearch, setStatusSearch] = useState('')
-  const [mtFilter,     setMtFilter    ] = useState('')
-  const [amountMin,    setAmountMin   ] = useState('')
-  const [amountMax,    setAmountMax   ] = useState('')
-  const [dateFrom,     setDateFrom    ] = useState('')
-  const [dateTo,       setDateTo      ] = useState('')
+  const [session,        setSession       ] = useState<UserSession | null>(null)
+  const [page,           setPage          ] = useState(1)
+  const [toast,          setToast         ] = useState<{ msg: string; type: 'ok' | 'err' } | null>(null)
+  const [orderIdInput,   setOrderIdInput  ] = useState('')
+  const [dealerInput,    setDealerInput   ] = useState('')
+  const [statusSearch,   setStatusSearch  ] = useState('')
+  const [mtFilter,       setMtFilter      ] = useState('')
+  const [amountMin,      setAmountMin     ] = useState('')
+  const [amountMax,      setAmountMax     ] = useState('')
+  const [dateFrom,       setDateFrom      ] = useState('')
+  const [dateTo,         setDateTo        ] = useState('')
+  const [exportingAll,   setExportingAll  ] = useState(false)
+  const [exportingFilt,  setExportingFilt ] = useState(false)
 
   useEffect(() => {
     const s = resolveSession()
@@ -406,8 +474,60 @@ export default function OrdersPage() {
   const startIndex = total === 0 ? 0 : (page - 1) * ITEMS_PER_PAGE + 1
   const endIndex   = total === 0 ? 0 : Math.min(page * ITEMS_PER_PAGE, total)
 
+  // Stats across ALL fetched data (not just current page slice)
+  const statsBase = hasClientFilters ? filteredAll : allData
+  const acceptedCount = statsBase.filter(o => o.accept_order === '1').length
+  const awaitingCount = statsBase.filter(o => o.accept_order === '0').length
+
   const clearSearch     = () => { setOrderIdInput(''); setDealerInput(''); setStatusSearch('') }
   const clearAllFilters = () => { setMtFilter(''); setAmountMin(''); setAmountMax(''); setDateFrom(''); setDateTo('') }
+
+  // ── Export handlers ──────────────────────────────────────────────────────────
+  const handleExportAll = useCallback(async () => {
+    if (!session || !cfg) return
+    setExportingAll(true)
+    try {
+      const res = await axios.get<OrderResponse>(cfg.allPagesEndpoint(session.id, ''))
+      const orders = res.data?.data || []
+      exportToExcel(orders, `orders_all_${new Date().toISOString().slice(0, 10)}`, cfg.showDealerCol)
+      setToast({ msg: `Exported ${orders.length} orders to Excel.`, type: 'ok' })
+    } catch {
+      setToast({ msg: 'Export failed. Please try again.', type: 'err' })
+    } finally {
+      setExportingAll(false)
+    }
+  }, [session, cfg])
+
+  const handleExportFiltered = useCallback(async () => {
+    if (!session || !cfg) return
+    setExportingFilt(true)
+    try {
+      // Fetch all pages with current server-side search, then apply client filters
+      const res = await axios.get<OrderResponse>(cfg.allPagesEndpoint(session.id, serverSearch))
+      const rawOrders = res.data?.data || []
+      const filtered = rawOrders.filter(o => {
+        if (orderIdInput.trim() && !o.order_id.startsWith(orderIdInput.trim())) return false
+        if (statusSearch !== '' && o.accept_order !== statusSearch) return false
+        if (mtFilter     !== '' && o.mtstatus     !== mtFilter)     return false
+        if (amountMin    !== '' && Number(o.order_amount || 0) < Number(amountMin)) return false
+        if (amountMax    !== '' && Number(o.order_amount || 0) > Number(amountMax)) return false
+        if (dateFrom !== '') { const d = (o.orderDate || o.order_date || '').slice(0, 10); if (d < dateFrom) return false }
+        if (dateTo   !== '') { const d = (o.orderDate || o.order_date || '').slice(0, 10); if (d > dateTo)   return false }
+        return true
+      })
+      exportToExcel(filtered, `orders_filtered_${new Date().toISOString().slice(0, 10)}`, cfg.showDealerCol)
+      setToast({ msg: `Exported ${filtered.length} filtered orders.`, type: 'ok' })
+    } catch {
+      setToast({ msg: 'Export failed. Please try again.', type: 'err' })
+    } finally {
+      setExportingFilt(false)
+    }
+  }, [session, cfg, serverSearch, orderIdInput, statusSearch, mtFilter, amountMin, amountMax, dateFrom, dateTo])
+
+  const handleExportSingle = useCallback((order: OrderData) => {
+    exportToExcel([order], `order_${order.order_id}_${new Date().toISOString().slice(0, 10)}`, cfg?.showDealerCol ?? false)
+    setToast({ msg: `Order OM/${YEAR}/${order.order_id} exported.`, type: 'ok' })
+  }, [cfg])
 
   const handleDelete = useCallback(async (id: string) => {
     if (!session || !cfg) return
@@ -461,6 +581,13 @@ export default function OrdersPage() {
 
   if (!session || !cfg) return null
 
+  const ExcelIcon = (
+    <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round">
+      <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4" />
+      <polyline points="7 10 12 15 17 10" /><line x1="12" y1="15" x2="12" y2="3" />
+    </svg>
+  )
+
   return (
     <>
       <style>{`
@@ -496,6 +623,7 @@ export default function OrdersPage() {
         td:first-child { padding-left: 20px; } td:last-child { padding-right: 20px; }
         .shimmer { height: 13px; border-radius: 6px; background: linear-gradient(90deg, #f0f2f8 25%, #e4e8f2 50%, #f0f2f8 75%); background-size: 200% 100%; animation: sh 1.4s infinite; }
         @keyframes sh { 0%{background-position:200% 0} 100%{background-position:-200% 0} }
+        @keyframes spin { from { transform: rotate(0deg) } to { transform: rotate(360deg) } }
         .order-id-pill { font-family: 'JetBrains Mono', monospace; font-size: 11px; font-weight: 500; background: #f1f3fb; color: #4b5563; padding: 3px 8px; border-radius: 6px; border: 1px solid #e2e6ef; }
         .amount-pill { font-family: 'JetBrains Mono', monospace; font-size: 11.5px; font-weight: 600; color: #065f46; background: #ecfdf5; border: 1px solid #a7f3d0; padding: 3px 9px; border-radius: 20px; white-space: nowrap; }
         .dealer-name { font-weight: 500; color: #1e293b; font-size: 12.5px; }
@@ -525,6 +653,8 @@ export default function OrdersPage() {
         .toast-err { background: #fff1f2; color: #be123c; border: 1px solid #fecdd3; }
         @keyframes slideUp { from { transform: translateY(12px); opacity: 0; } to { transform: translateY(0); opacity: 1; } }
         .active-tags { display: flex; flex-wrap: wrap; gap: 6px; margin-bottom: 14px; }
+        .export-bar { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+        .export-divider { width: 1px; height: 22px; background: #e2e6ef; margin: 0 2px; }
       `}</style>
 
       <div className="orders-root">
@@ -561,11 +691,42 @@ export default function OrdersPage() {
 
         <div className="orders-body">
 
-          {/* Heading */}
+          {/* Heading + Export bar */}
           <div className="flex items-end justify-between flex-wrap gap-4 mb-5">
             <div>
               <h1 className="text-2xl font-bold tracking-tight">Orders</h1>
               <p className="text-sm text-slate-500 mt-1">{cfg.caption}</p>
+            </div>
+
+            {/* ── Export buttons ── */}
+            <div className="export-bar">
+              <ExportButton
+                label="Export All"
+                sublabel={`All orders · .xlsx`}
+                icon={ExcelIcon}
+                color="#065f46"
+                bg="#f0fdf4"
+                border="#bbf7d0"
+                hoverBg="#dcfce7"
+                loading={exportingAll}
+                onClick={handleExportAll}
+              />
+              {hasClientFilters && (
+                <>
+                  <div className="export-divider" />
+                  <ExportButton
+                    label="Export Filtered"
+                    sublabel={`${filteredAll.length} matching · .xlsx`}
+                    icon={ExcelIcon}
+                    color="#1d4ed8"
+                    bg="#eff6ff"
+                    border="#bfdbfe"
+                    hoverBg="#dbeafe"
+                    loading={exportingFilt}
+                    onClick={handleExportFiltered}
+                  />
+                </>
+              )}
             </div>
           </div>
 
@@ -584,12 +745,12 @@ export default function OrdersPage() {
             </div>
           )}
 
-          {/* Stats */}
+          {/* Stats — accepted/awaiting now across ALL fetched data */}
           {!isLoading && (
             <div className="stats-row">
               <div className="stat-pill"><span className="stat-dot" style={{ background: '#6366f1' }} />{hasClientFilters ? 'Filtered' : 'Total'}<span className="stat-num">{total.toLocaleString()}</span></div>
-              <div className="stat-pill"><span className="stat-dot" style={{ background: '#1d4ed8' }} />Accepted<span className="stat-num">{data.filter(o => o.accept_order === '1').length}</span></div>
-              <div className="stat-pill"><span className="stat-dot" style={{ background: '#f59e0b' }} />Awaiting<span className="stat-num">{data.filter(o => o.accept_order === '0').length}</span></div>
+              <div className="stat-pill"><span className="stat-dot" style={{ background: '#1d4ed8' }} />Accepted<span className="stat-num">{acceptedCount}</span></div>
+              <div className="stat-pill"><span className="stat-dot" style={{ background: '#f59e0b' }} />Awaiting<span className="stat-num">{awaitingCount}</span></div>
               <div className="stat-pill"><span className="stat-dot" style={{ background: '#3b82f6' }} />Page<span className="stat-num">{page} / {totalPages}</span></div>
             </div>
           )}
@@ -738,11 +899,11 @@ export default function OrdersPage() {
                               showDelete={showDelete}
                               showAccept={showAccept}
                               acceptOrder={order.accept_order}
-                              // ── unified route: same detail page as order history ──
                               onView={() => router.push(`/orders/${order.order_id}`)}
                               onAccept={() => handleAccept(order.order_id, 1)}
                               onDecline={() => handleAccept(order.order_id, 0)}
                               onDelete={() => handleDelete(order.order_id)}
+                              onExport={() => handleExportSingle(order)}
                             />
                           </td>
                         )}

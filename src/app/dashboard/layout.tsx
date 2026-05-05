@@ -4,9 +4,12 @@ import { useState, useEffect } from "react";
 
 import Sidebar from "@/components/layout/sidebar";
 import SmartSearchBar from "@/components/SartSearchBar";
+import { useRouter } from "next/navigation";
 type Role = "admin" | "dealer" | "staff";
 
 function resolveUser() {
+
+  
   if (typeof window === "undefined") return null;
   try {
     const staffRaw = localStorage.getItem("staffData");
@@ -34,6 +37,7 @@ function resolveUser() {
 export default function DashboardLayout({ children }: { children: React.ReactNode }) {
   const [open, setOpen] = useState(false);
   const [user, setUser] = useState<any>(null);
+  const router = useRouter();
 
   useEffect(() => { setUser(resolveUser()); }, []);
 
@@ -121,6 +125,7 @@ export default function DashboardLayout({ children }: { children: React.ReactNod
 
             {/* Logo */}
             <img
+            onClick={()=>router.push("/home")}
               src="https://omsonsapp.vercel.app/headicon.png"
               alt="Omsons"
               style={{ height: 44, flexShrink: 0 }}

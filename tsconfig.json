@@ -38,7 +38,7 @@
     "**/*.mts",
     "src/app/Products/[sku]",
     "src/app/dashboard/admin/dealer/[id]"
-, "src/lib/json.js"  ],
+, "src/lib/json.js", "src/app/auth/login/accountantLogin"  ],
   "exclude": [
     "node_modules"
   ]

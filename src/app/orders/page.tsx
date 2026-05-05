@@ -1,574 +1,981 @@
+// app/order/page.tsx
 "use client";
 
-import { useState, useEffect } from "react";
-import { useQuery, keepPreviousData } from "@tanstack/react-query";
-import { useRouter } from "next/navigation";
+import React, { useState, useEffect, useRef, Suspense } from "react";
+import axios from "axios";
+import { useRouter, useSearchParams } from "next/navigation";
+import { toast, ToastContainer } from "react-toastify";
+import Select from "react-select";
 import moment from "moment";
-import { exportOrdersToSupabase, downloadPDFDirectly } from "@/lib/Exporttopdf";
-import { InvoiceModal } from "@/components/InvoiceModel";
-import { downloadOrderInvoice, uploadOrderInvoiceToSupabase, generateOrderInvoicePDF } from "@/lib/invoicegenerator";
+import { useCartStore } from "@/Store/store";
+import {
+  saveDraft,
+  updateDraft,
+  getDraftById,
+  type DraftProductRow,
+} from "@/lib/drafts";
+import {
+  useRewardStore,
+  REWARD_THRESHOLD,
+  REWARD_RATE,
+} from "@/Store/rewardStore";
 
 // ─── Types ────────────────────────────────────────────────────────────────────
-type Order = {
-  order_id: string;
-  order_date: string;
-  order_amount: string;
-  order_discount: string;
-  Dealer_Name: string;
-  orderdata_item_quantity: string;
-  mtstatus: string;
-  outstandingDate: string;
-  reason?: string;
-};
-type ApiResponse = { msg: string; count: number; status: boolean; data: Order[] };
-
-const PAGE_SIZE = 10;
-const BACKEND = "https://mirisoft.co.in/sas/dealerapi/api";
-
-const getDealerId = () => {
-  try { return JSON.parse(localStorage.getItem("UserData") ?? "{}")?.Dealer_Id ?? "225"; }
-  catch { return "225"; }
+type ProductRow = {
+  key: number;
+  productname: string;
+  displayName: string;
+  variantCode: string;
+  producQuanity: number;
+  price: number;
+  packSize: number;
 };
 
-async function fetchOrders(page: number, search: string, id: string): Promise<ApiResponse> {
-  const r = await fetch(`${BACKEND}/orderhispegination?page=${page}&search=${search}&id=${id}`);
-  if (!r.ok) throw new Error("Failed");
-  return r.json();
+type OptionType = { value: string; label: string; price: number };
+type ProductMeta = { image: string | null; productName: string; packSize: number };
+
+function buildVariantLookup(data: any[]): Record<string, ProductMeta> {
+  const map: Record<string, ProductMeta> = {};
+  for (const product of data) {
+    const image   = (product.Images ?? []).find(Boolean) ?? null;
+    const desc    = product.Description ?? "";
+    const packMap = parsePackSizes(desc);
+    for (const variant of product.variants ?? []) {
+      map[variant.SKU] = { image, productName: product.Name, packSize: packMap[variant.SKU] ?? 1 };
+    }
+  }
+  return map;
 }
 
-const statusConf: Record<string, { label: string; dot: string; text: string; bg: string }> = {
-  inprocess:  { label: "In Process", dot: "bg-amber-400",   text: "text-amber-800",   bg: "bg-amber-50 border-amber-200"   },
-  processing: { label: "Processing", dot: "bg-blue-400",    text: "text-blue-800",    bg: "bg-blue-50 border-blue-200"     },
-  dispatched: { label: "Dispatched", dot: "bg-indigo-400",  text: "text-indigo-800",  bg: "bg-indigo-50 border-indigo-200" },
-  successful: { label: "Successful", dot: "bg-emerald-400", text: "text-emerald-800", bg: "bg-emerald-50 border-emerald-200"},
-  cancelled:  { label: "Cancelled",  dot: "bg-red-400",     text: "text-red-800",     bg: "bg-red-50 border-red-200"       },
-};
+function parsePackSizes(html: string): Record<string, number> {
+  const result: Record<string, number> = {};
+  if (!html) return result;
+  const theadMatch = html.match(/<thead>([\s\S]*?)<\/thead>/i);
+  if (!theadMatch) return result;
+  const headers = [...theadMatch[1].matchAll(/<td>([\s\S]*?)<\/td>/gi)]
+    .map(m => m[1].replace(/<[^>]*>/g, "").trim());
+  const packIdx = headers.findIndex(h => /pack|qty|quantity/i.test(h));
+  if (packIdx === -1) return result;
+  const tbodyMatch = html.match(/<tbody>([\s\S]*?)<\/tbody>/i);
+  if (!tbodyMatch) return result;
+  [...tbodyMatch[1].matchAll(/<tr>([\s\S]*?)<\/tr>/gi)].forEach(tr => {
+    const cells = [...tr[1].matchAll(/<td>([\s\S]*?)<\/td>/gi)]
+      .map(m => m[1].replace(/<[^>]*>/g, "").trim());
+    const catNo = cells[0];
+    const n     = parseInt(cells[packIdx] ?? "1", 10);
+    if (catNo) result[catNo] = isNaN(n) ? 1 : n;
+  });
+  return result;
+}
 
-function MtStatusBadge({ status }: { status: string }) {
-  const key = status?.toLowerCase().replace(/\s/g, "") ?? "";
-  const s = statusConf[key] ?? { label: status || "—", dot: "bg-gray-300", text: "text-gray-700", bg: "bg-gray-50 border-gray-200" };
+/** Format paise → ₹ string */
+function fmt(paise: number): string {
+  return `₹${(paise / 100).toLocaleString("en-IN", { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`;
+}
+
+/** grandTotal is in paise; convert to rupees for reward logic */
+const toRupees = (paise: number) => Math.round(paise / 100);
+
+const COUPONS: Record<string, number> = { "test60": 60, "SAVE50": 50, "VIP80": 80 };
+
+const emptyRow = (): ProductRow => ({
+  key: Date.now() + Math.random(),
+  productname: "", displayName: "", variantCode: "",
+  producQuanity: 1, price: 0, packSize: 1,
+});
+
+// ─── Reward Banner ─────────────────────────────────────────────────────────────
+function RewardBanner({
+  grandTotalPaise,
+  dealerId,
+}: {
+  grandTotalPaise: number;
+  dealerId: string;
+}) {
+  const getDealerPoints = useRewardStore(s => s.getDealerPoints);
+  const [mounted, setMounted] = useState(false);
+  useEffect(() => setMounted(true), []);
+  if (!mounted) return null;
+
+  const totalRupees     = toRupees(grandTotalPaise);
+  const existingPoints  = getDealerPoints(dealerId);
+  const qualifies       = totalRupees >= REWARD_THRESHOLD;
+  const potentialPoints = qualifies ? Math.round(totalRupees * REWARD_RATE) : 0;
+  const shortfall       = REWARD_THRESHOLD - totalRupees; // negative when over
+  const progressPct     = Math.min(100, (totalRupees / REWARD_THRESHOLD) * 100);
+
+  // Don't render if no existing points and far from threshold
+  if (existingPoints === 0 && !qualifies && shortfall > 50_000) return null;
+
   return (
-    <span className={`inline-flex items-center gap-1.5 px-2.5 py-0.5 rounded-full text-[11px] font-semibold border ${s.bg} ${s.text}`}>
-      <span className={`w-1.5 h-1.5 rounded-full flex-shrink-0 ${s.dot}`} />
-      {s.label}
-    </span>
+    <div className={`mx-0 mb-0 rounded-none border-t px-6 py-4 flex items-start gap-4 ${
+      qualifies
+        ? "bg-gradient-to-r from-amber-50 to-yellow-50 border-amber-100"
+        : "bg-gray-50 border-gray-100"
+    }`}>
+      {/* Star icon */}
+      <div className={`w-10 h-10 rounded-xl flex items-center justify-center flex-shrink-0 mt-0.5 ${
+        qualifies ? "bg-amber-100" : "bg-gray-100"
+      }`}>
+        <svg width="17" height="17" viewBox="0 0 24 24" fill={qualifies ? "#f59e0b" : "#d1d5db"}
+          stroke={qualifies ? "#d97706" : "#9ca3af"} strokeWidth="1.5" strokeLinecap="round">
+          <polygon points="12 2 15.09 8.26 22 9.27 17 14.14 18.18 21.02 12 17.77 5.82 21.02 7 14.14 2 9.27 8.91 8.26 12 2"/>
+        </svg>
+      </div>
+
+      <div className="flex-1 min-w-0">
+        <div className="flex items-center gap-2 flex-wrap mb-1">
+          <span className={`text-[13px] font-bold ${qualifies ? "text-amber-800" : "text-gray-600"}`}>
+            Reward Points
+          </span>
+          {existingPoints > 0 && (
+            <span className="px-2 py-0.5 bg-amber-200 text-amber-900 rounded-full text-[10px] font-bold border border-amber-300">
+              ₹{existingPoints.toLocaleString("en-IN")} accumulated
+            </span>
+          )}
+          {qualifies && (
+            <span className="px-2 py-0.5 bg-emerald-100 text-emerald-700 rounded-full text-[10px] font-bold border border-emerald-200">
+              ✓ Qualifies
+            </span>
+          )}
+        </div>
+
+        {qualifies ? (
+          <p className="text-[12.5px] text-amber-700 leading-relaxed">
+            🎉 This order qualifies! You'll earn{" "}
+            <span className="font-bold text-amber-900">
+              ₹{potentialPoints.toLocaleString("en-IN")}
+            </span>{" "}
+            in reward credits (0.5% of ₹{totalRupees.toLocaleString("en-IN")}) once placed successfully.
+          </p>
+        ) : (
+          <>
+            <p className="text-[12px] text-gray-500 leading-relaxed">
+              Add{" "}
+              <span className="font-semibold text-gray-700">
+                ₹{shortfall.toLocaleString("en-IN")}
+              </span>{" "}
+              more to unlock 0.5% reward credits on this order (min ₹1,00,000).
+            </p>
+            {/* Progress bar */}
+            <div className="mt-2 max-w-xs">
+              <div className="h-1.5 bg-gray-200 rounded-full overflow-hidden">
+                <div
+                  className="h-full bg-gradient-to-r from-amber-400 to-yellow-400 rounded-full transition-all duration-700"
+                  style={{ width: `${progressPct.toFixed(1)}%` }}
+                />
+              </div>
+              <p className="text-[10px] text-gray-400 mt-1 font-mono">
+                {progressPct.toFixed(0)}% of ₹1,00,000 threshold
+              </p>
+            </div>
+          </>
+        )}
+      </div>
+
+      {/* Right: potential earning chip */}
+      {qualifies && (
+        <div className="flex-shrink-0 text-right hidden sm:block">
+          <div className="bg-amber-100 border border-amber-300 rounded-xl px-4 py-2.5 text-center">
+            <p className="text-[9.5px] font-bold text-amber-600 uppercase tracking-widest mb-0.5">You earn</p>
+            <p className="text-[18px] font-bold text-amber-800 leading-none font-mono">
+              ₹{potentialPoints.toLocaleString("en-IN")}
+            </p>
+            <p className="text-[9.5px] text-amber-600 mt-0.5">on success</p>
+          </div>
+        </div>
+      )}
+    </div>
   );
 }
 
-function SkeletonRow() {
-  return (
-    <tr className="border-b border-gray-100">
-      {[60, 120, 90, 80, 80, 90, 80, 100, 80, 160].map((w, i) => (
-        <td key={i} className="px-4 py-4">
-          <div className="h-3.5 bg-gray-100 rounded animate-pulse" style={{ width: w }} />
-        </td>
-      ))}
-    </tr>
-  );
-}
+// ─────────────────────────────────────────────────────────────────────────────
+// Inner component
+// ─────────────────────────────────────────────────────────────────────────────
+function AddOrderPageInner() {
+  const router       = useRouter();
+  const searchParams = useSearchParams();
+  const draftIdParam = searchParams.get("draft");
 
-// ─── Per-row Invoice Button — always visible ──────────────────────────────────
-function InvoiceRowButton({ order }: { order: Order }) {
-  const [loading,  setLoading ] = useState(false);
-  const [showMenu, setShowMenu] = useState(false);
-  const [toast,    setToast   ] = useState<{ type: "success" | "error"; text: string } | null>(null);
+  const cartItems = useCartStore((s) => s.cart);
+  const clearCart = useCartStore((s) => s.clearCart);
 
-  const showToast = (type: "success" | "error", text: string) => {
-    setToast({ type, text });
-    setTimeout(() => setToast(null), 3000);
+  // ── Reward store ──────────────────────────────────────────────────────────
+  const addReward    = useRewardStore(s => s.addReward);
+  const cancelReward = useRewardStore(s => s.cancelReward);
+
+  const [loading,       setLoading]       = useState(false);
+  const [draftSaving,   setDraftSaving]   = useState(false);
+  const [user,          setUser]          = useState<any>(null);
+  const [products,      setProducts]      = useState<any[]>([]);
+  const [variantLookup, setVariantLookup] = useState<Record<string, ProductMeta>>({});
+  const [shipto,        setShipto]        = useState("");
+  const [refno,         setRefno]         = useState("");
+  const [file,          setFile]          = useState<File | null>(null);
+  const [tab,           setTab]           = useState<"manual" | "excel">("manual");
+  const [mounted,       setMounted]       = useState(false);
+  const seededRef                         = useRef(false);
+
+  // ── Draft state ───────────────────────────────────────────────────────────
+  const [activeDraftId,    setActiveDraftId]    = useState<string | null>(null);
+  const [draftName,        setDraftName]        = useState("Untitled Draft");
+  const [showNameModal,    setShowNameModal]    = useState(false);
+  const [pendingDraftName, setPendingDraftName] = useState("");
+  const [draftBanner,      setDraftBanner]      = useState<string | null>(null);
+
+  // ── Coupon state ──────────────────────────────────────────────────────────
+  const [couponInput,   setCouponInput]   = useState("");
+  const [appliedCoupon, setAppliedCoupon] = useState<{ code: string; pct: number } | null>(null);
+  const [couponError,   setCouponError]   = useState("");
+  const [couponSuccess, setCouponSuccess] = useState("");
+
+  const [arr1, setArr] = useState<ProductRow[]>([emptyRow()]);
+
+  useEffect(() => { setMounted(true); }, []);
+
+  useEffect(() => {
+    const stored   = localStorage.getItem("UserData");
+    const loggedIn = localStorage.getItem("status");
+    if (!stored || JSON.parse(loggedIn ?? "false") !== true) { router.push("/login"); return; }
+    const u = JSON.parse(stored);
+    setUser(u);
+    setShipto(u.Dealer_Address[0].toUpperCase() + u.Dealer_Address.slice(1).toLowerCase());
+  }, []);
+
+  useEffect(() => {
+    if (!user) return;
+    Promise.all([
+      fetch(`https://mirisoft.co.in/sas/dealerapi/api/productname`).then(r => r.json()),
+      axios.get("/data/products.json").then(r => r.data),
+    ]).then(([apiData, localData]) => {
+      setProducts(apiData.data ?? []);
+      setVariantLookup(buildVariantLookup(localData));
+    }).catch(() => {
+      fetch(`https://mirisoft.co.in/sas/dealerapi/api/productname`)
+        .then(r => r.json()).then(d => setProducts(d.data ?? []));
+    });
+  }, [user]);
+
+  useEffect(() => {
+    if (!draftIdParam || !user || products.length === 0) return;
+    if (seededRef.current) return;
+    seededRef.current = true;
+
+    getDraftById(draftIdParam, user.Dealer_Id).then((draft) => {
+      if (!draft) { toast.error("Draft not found or does not belong to your account."); return; }
+      setActiveDraftId(draft.id);
+      setDraftName(draft.name);
+      if (draft.shipto)  setShipto(draft.shipto);
+      if (draft.refno)   setRefno(draft.refno);
+      if (draft.coupon_code && draft.coupon_pct) {
+        setAppliedCoupon({ code: draft.coupon_code, pct: draft.coupon_pct });
+      }
+      setArr(draft.rows.length > 0 ? draft.rows : [emptyRow()]);
+      setDraftBanner(`Loaded: "${draft.name}"`);
+    }).catch(() => toast.error("Could not load draft."));
+  }, [draftIdParam, user, products]);
+
+  useEffect(() => {
+    if (seededRef.current) return;
+    if (products.length === 0 || draftIdParam) return;
+    seededRef.current = true;
+
+    if (cartItems.length === 0) { setArr([emptyRow()]); return; }
+
+    setArr(cartItems.map((item, i) => {
+      const match       = products.find(p =>
+        String(p.product_cat).trim() === String(item.id).trim() ||
+        String(p.product_id).trim()  === String(item.id).trim()
+      );
+      const nameParts   = item.name.split(" - ");
+      const productName = nameParts[0] ?? item.name;
+      const variantCode = nameParts.length > 1 ? nameParts[nameParts.length - 1] : item.id;
+      const localMeta   = variantLookup[item.id];
+      const packSize    = localMeta?.packSize ?? (item as any).packSize ?? 1;
+      const price       = Number(item.price) > 0 ? Number(item.price) : (match ? Number(match.product_price) : 0);
+      return {
+        key: i + 1,
+        productname:   match ? String(match.product_cat) : String(item.id),
+        displayName:   match ? (match.product_name ?? productName) : productName,
+        variantCode, producQuanity: item.quantity, price, packSize,
+      };
+    }));
+  }, [products, cartItems, variantLookup, draftIdParam]);
+
+  const activeDiscount: number = appliedCoupon ? appliedCoupon.pct : (user?.discount ?? 0);
+  const dealerDiscount: number = user?.discount ?? 0;
+
+  const handleApplyCoupon = () => {
+    setCouponError(""); setCouponSuccess("");
+    const trimmed = couponInput.trim();
+    if (!trimmed) { setCouponError("Please enter a coupon code."); return; }
+    const pct = COUPONS[trimmed];
+    if (pct === undefined) { setCouponError("Invalid coupon code."); return; }
+    if (pct <= dealerDiscount) {
+      setCouponError(`This coupon gives ${pct}% off — your dealer rate (${dealerDiscount}%) is already better.`);
+      return;
+    }
+    setAppliedCoupon({ code: trimmed, pct });
+    setCouponSuccess(`"${trimmed}" applied — ${pct}% off (was ${dealerDiscount}%)`);
+    setCouponInput("");
   };
 
-  const handleDownload = async () => {
-    setLoading(true); setShowMenu(false);
-    const res = await downloadOrderInvoice(order);
-    setLoading(false);
-    showToast(res.success ? "success" : "error", res.success ? "PDF downloaded" : (res.error || "Download failed"));
+  const handleRemoveCoupon = () => {
+    setAppliedCoupon(null); setCouponError(""); setCouponSuccess(""); setCouponInput("");
   };
 
-  const handleUpload = async () => {
-    setLoading(true); setShowMenu(false);
+  const optionList: OptionType[] = products.map(p => ({
+    value: String(p.product_cat),
+    label: `${p.product_cat} — ${p.product_name}${p.product_discription ? ` (${p.product_discription})` : ""}`,
+    price: Number(p.product_price),
+  }));
+
+  const getSelectValue = (row: ProductRow): OptionType | null =>
+    optionList.find(o => String(o.value).trim() === String(row.productname).trim()) ?? null;
+
+  const handleChangeSelect = (opt: OptionType, idx: number) => {
+    const labelParts = opt.label.split(" — ");
+    const catNo      = labelParts[0]?.trim() ?? opt.value;
+    const rest       = labelParts.slice(1).join(" — ");
+    const namePart   = rest.split("(")[0].trim();
+    const localMeta  = variantLookup[opt.value];
+    const packSize   = localMeta?.packSize ?? 1;
+    setArr(prev => {
+      const n = [...prev];
+      n[idx] = { ...n[idx], productname: opt.value, displayName: namePart || opt.label, variantCode: catNo, price: opt.price, packSize };
+      return n;
+    });
+  };
+
+  const updateQuantity = (i: number, val: number) => {
+    const v = Math.max(1, val || 1);
+    setArr(prev => { const n = [...prev]; n[i] = { ...n[i], producQuanity: v }; return n; });
+  };
+
+  const addRow    = () => setArr(prev => [...prev, emptyRow()]);
+  const removeRow = (key: number) => setArr(prev => prev.filter(r => r.key !== key));
+
+  // ── Totals ────────────────────────────────────────────────────────────────
+  const grandTotal = arr1.reduce((acc, row) => {
+    const listPrice = row.producQuanity * row.price;
+    return acc + (listPrice - listPrice * (activeDiscount / 100));
+  }, 0);
+
+  const grandTotalWithoutCoupon = appliedCoupon
+    ? arr1.reduce((acc, row) => {
+        const lp = row.producQuanity * row.packSize * row.price;
+        return acc + (lp - Math.round(lp * (dealerDiscount / 100)));
+      }, 0)
+    : null;
+
+  // ── Draft handlers ────────────────────────────────────────────────────────
+  const commitSaveDraft = async (nameToUse: string) => {
+    if (!user) return;
+    setShowNameModal(false);
+    setDraftSaving(true);
+    const draftRows: DraftProductRow[] = arr1.map(r => ({ ...r }));
     try {
-      const blob = await generateOrderInvoicePDF(order);
-      const res  = await uploadOrderInvoiceToSupabase(blob, order);
-      showToast(res.success ? "success" : "error", res.success ? "Invoice saved to cloud" : (res.error || "Upload failed"));
-    } catch (e: any) {
-      showToast("error", e?.message || "Failed");
+      if (activeDraftId) {
+        await updateDraft(activeDraftId, user.Dealer_Id, {
+          name: nameToUse, shipto, refno,
+          coupon_code: appliedCoupon?.code ?? null,
+          coupon_pct:  appliedCoupon?.pct  ?? null,
+          rows: draftRows,
+        });
+        setDraftName(nameToUse);
+        toast.success("Draft updated ✓");
+      } else {
+        const created = await saveDraft({
+          dealer_id: user.Dealer_Id, name: nameToUse, shipto, refno,
+          coupon_code: appliedCoupon?.code ?? null,
+          coupon_pct:  appliedCoupon?.pct  ?? null,
+          rows: draftRows,
+        });
+        setActiveDraftId(created.id);
+        setDraftName(nameToUse);
+        toast.success("Draft saved ✓");
+        window.history.replaceState({}, "", `/order?draft=${created.id}`);
+      }
+    } catch {
+      toast.error("Could not save draft.");
+    } finally {
+      setDraftSaving(false);
+    }
+  };
+
+  const handleSaveDraft = () => {
+    if (arr1.every(r => !r.productname)) { toast("Add at least one product before saving a draft."); return; }
+    if (activeDraftId) {
+      commitSaveDraft(draftName);
+    } else {
+      setPendingDraftName(`Draft ${moment().format("MMM D, h:mm a")}`);
+      setShowNameModal(true);
+    }
+  };
+
+  // ── Submit Order ──────────────────────────────────────────────────────────
+  const handleSubmitProductArray = async () => {
+    if (arr1.every(r => !r.productname)) { toast("Please select at least one product"); return; }
+    setLoading(true);
+    const payload = arr1.filter(r => r.productname).map(r => ({
+      productname:   r.productname,
+      producQuanity: String(r.producQuanity),
+      price:         String(r.price),
+      remarks:       r.variantCode ? `Cat. No: ${r.variantCode}` : "",
+    }));
+    const fd = new FormData();
+    fd.append("productorder",  JSON.stringify(payload));
+    fd.append("Dealer_shipto", shipto);
+    fd.append("id",            user.Dealer_Id);
+    fd.append("discount",      String(activeDiscount));
+    if (refno)         fd.append("refno",       refno);
+    if (appliedCoupon) fd.append("coupon_code", appliedCoupon.code);
+    try {
+      const { data } = await axios.post(
+        `https://mirisoft.co.in/sas/dealerapi/api/PlaceOrderarray?id=${user.Dealer_Id}&staffid=${user.assignedstaff}`,
+        fd
+      );
+      toast.success(data.msg, { autoClose: 5000 });
+
+      // ── Award reward points on successful placement ──────────────────────
+      const orderId       = data?.order_id ?? `ord_${Date.now()}`;
+      const totalRupees   = toRupees(grandTotal);
+      const earned        = addReward({
+        orderId,
+        dealerId:   String(user.Dealer_Id),
+        dealerName: user.Dealer_Name,
+        orderTotal: totalRupees,
+      });
+      if (earned) {
+        toast.success(
+          `⭐ ₹${earned.points.toLocaleString("en-IN")} reward points earned!`,
+          { autoClose: 6000 }
+        );
+      }
+
+      clearCart();
+      seededRef.current = false;
+      setArr([emptyRow()]);
+      handleRemoveCoupon();
+      setActiveDraftId(null);
+      setDraftBanner(null);
+    } catch {
+      toast.error("Order failed, please try again.", { autoClose: 5000 });
     } finally {
       setLoading(false);
     }
   };
 
-  return (
-    <div className="relative">
-      <button
-        onClick={() => setShowMenu(v => !v)}
-        disabled={loading}
-        title="Invoice PDF"
-        className="flex items-center gap-1.5 px-2.5 py-1.5 bg-white border border-gray-200 hover:border-blue-300 hover:bg-blue-50 text-gray-700 hover:text-blue-700 rounded-lg text-[11px] font-semibold transition-all shadow-sm disabled:opacity-50"
-      >
-        {loading
-          ? <div className="w-3 h-3 border-2 border-current border-t-transparent rounded-full animate-spin" />
-          : <svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
-              <path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/>
-              <polyline points="14 2 14 8 20 8"/>
-              <line x1="16" y1="13" x2="8" y2="13"/>
-              <line x1="16" y1="17" x2="8" y2="17"/>
-            </svg>
-        }
-        Invoice
-      </button>
-
-      {showMenu && (
-        <>
-          <div className="fixed inset-0 z-30" onClick={() => setShowMenu(false)} />
-          <div className="absolute right-0 mt-1.5 w-52 bg-white rounded-xl shadow-xl border border-gray-200 z-40 overflow-hidden">
-            <button
-              onClick={handleDownload}
-              className="w-full text-left px-4 py-3 text-[12px] text-gray-700 hover:bg-blue-50 flex items-center gap-3 border-b border-gray-100 transition-colors"
-            >
-              <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
-                <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/>
-                <polyline points="7 10 12 15 17 10"/>
-                <line x1="12" y1="15" x2="12" y2="3"/>
-              </svg>
-              <div>
-                <p className="font-semibold">Download PDF</p>
-                <p className="text-[10px] text-gray-400 mt-0.5">Save to device</p>
-              </div>
-            </button>
-            <button
-              onClick={handleUpload}
-              className="w-full text-left px-4 py-3 text-[12px] text-gray-700 hover:bg-emerald-50 flex items-center gap-3 transition-colors"
-            >
-              <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
-                <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/>
-                <polyline points="7 14 12 9 17 14"/>
-                <line x1="12" y1="9" x2="12" y2="21"/>
-              </svg>
-              <div>
-                <p className="font-semibold">Save to Cloud</p>
-                <p className="text-[10px] text-gray-400 mt-0.5">Upload to Supabase</p>
-              </div>
-            </button>
-          </div>
-        </>
-      )}
-
-      {toast && (
-        <div className={`fixed bottom-4 right-4 z-50 flex items-center gap-2 px-4 py-2.5 rounded-xl text-[12px] font-medium shadow-lg border ${
-          toast.type === "success" ? "bg-emerald-50 text-emerald-800 border-emerald-200" : "bg-red-50 text-red-800 border-red-200"
-        }`}>
-          {toast.type === "success"
-            ? <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5"><polyline points="20 6 9 17 4 12"/></svg>
-            : <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"><circle cx="12" cy="12" r="10"/><line x1="12" y1="8" x2="12" y2="12"/></svg>
-          }
-          {toast.text}
-        </div>
-      )}
-    </div>
-  );
-}
-
-// ─── Export Button ─────────────────────────────────────────────────────────────
-interface ExportButtonProps {
-  orders: Order[];
-  dealerName: string;
-  dealerId: string;
-  isLoading?: boolean;
-}
-
-function ExportButton({ orders, dealerName, dealerId, isLoading = false }: ExportButtonProps) {
-  const [isExporting, setIsExporting] = useState(false);
-  const [showNotification, setShowNotification] = useState<{ type: "success" | "error"; message: string } | null>(null);
-  const [showMenu, setShowMenu] = useState(false);
-
-  const handleExport = async (uploadToSupabase: boolean) => {
-    if (orders.length === 0) { setShowNotification({ type: "error", message: "No orders to export" }); setShowMenu(false); return; }
-    setIsExporting(true); setShowMenu(false);
+  const handleSubmitFile = async (e: React.FormEvent) => {
+    e.preventDefault();
+    if (!file) return;
+    setLoading(true);
+    const fd = new FormData();
+    fd.append("staffid",      user.assignedstaff);
+    fd.append("order_dealer", user.Dealer_Id);
+    fd.append("exelefile",    file);
     try {
-      if (uploadToSupabase) {
-        const result = await exportOrdersToSupabase({ orders, dealerName, dealerId, title: `Order History - ${dealerName}`, fileName: `orders_${moment().format("YYYY-MM-DD")}` });
-        setShowNotification({ type: result.success ? "success" : "error", message: result.success ? "PDF exported to Supabase! 🎉" : (result.error || "Failed") });
-      } else {
-        const result = await downloadPDFDirectly({ orders, dealerName, title: `Order History - ${dealerName}`, fileName: `orders_${moment().format("YYYY-MM-DD")}.pdf` });
-        setShowNotification({ type: result.success ? "success" : "error", message: result.success ? "PDF downloaded successfully! 📥" : (result.error || "Failed") });
-      }
-    } catch (error) {
-      setShowNotification({ type: "error", message: error instanceof Error ? error.message : "Export failed" });
+      const { data } = await axios.post(`${process.env.NEXT_PUBLIC_BACKEND_URL}/api/importdata`, fd);
+      toast.success(data.msg);
+    } catch {
+      toast.error("Upload failed.");
     } finally {
-      setIsExporting(false);
-      setTimeout(() => setShowNotification(null), 4000);
+      setLoading(false);
     }
   };
 
+  if (!user) return (
+    <div className="flex items-center justify-center h-[60vh] text-gray-400 text-sm">Loading…</div>
+  );
+
+  const docDate = moment().format("MMMM Do YYYY");
+
+  const selectStyles = {
+    control: (base: any, state: any) => ({
+      ...base,
+      border: `1px solid ${state.isFocused ? "#6366f1" : "#e5e7eb"}`,
+      borderRadius: 10, boxShadow: state.isFocused ? "0 0 0 3px rgba(99,102,241,0.1)" : "none",
+      fontSize: 13, minHeight: 38, fontFamily: "inherit",
+      "&:hover": { borderColor: "#d1d5db" },
+    }),
+    option: (base: any, state: any) => ({
+      ...base, fontSize: 13,
+      backgroundColor: state.isSelected ? "#6366f1" : state.isFocused ? "#f5f5ff" : "white",
+      color: state.isSelected ? "#fff" : "#111827",
+    }),
+    placeholder:        (base: any) => ({ ...base, color: "#9ca3af", fontSize: 13 }),
+    singleValue:        (base: any) => ({ ...base, color: "#111827", fontSize: 13 }),
+    menu:               (base: any) => ({ ...base, borderRadius: 10, border: "1px solid #e5e7eb", boxShadow: "0 8px 30px rgba(0,0,0,0.1)" }),
+    indicatorSeparator: ()          => ({ display: "none" }),
+  };
+
   return (
     <>
-      <div className="relative">
-        <button
-          onClick={() => setShowMenu(!showMenu)}
-          disabled={isLoading || isExporting || orders.length === 0}
-          className="flex items-center gap-2 px-4 py-2 bg-indigo-600 hover:bg-indigo-700 disabled:opacity-50 disabled:cursor-not-allowed text-white text-[13px] font-semibold rounded-xl transition-colors"
-        >
-          {isExporting ? (
-            <><div className="w-3.5 h-3.5 border-2 border-white border-t-transparent rounded-full animate-spin" />Exporting…</>
+      <ToastContainer position="top-right" autoClose={5000} />
+
+      {/* ── Draft Name Modal ── */}
+      {showNameModal && (
+        <div className="fixed inset-0 z-[1000] bg-black/40 backdrop-blur-sm flex items-center justify-center p-4">
+          <div className="bg-white rounded-2xl shadow-2xl w-full max-w-sm p-6">
+            <h3 className="text-[15px] font-bold text-gray-900 mb-1">Save as Draft</h3>
+            <p className="text-[12.5px] text-gray-400 mb-4">Give this draft a name so you can find it easily.</p>
+            <input autoFocus type="text" value={pendingDraftName}
+              onChange={e => setPendingDraftName(e.target.value)}
+              onKeyDown={e => {
+                if (e.key === "Enter" && pendingDraftName.trim()) commitSaveDraft(pendingDraftName.trim());
+                if (e.key === "Escape") setShowNameModal(false);
+              }}
+              placeholder="e.g. Q2 Restock Order"
+              className="w-full border border-gray-200 rounded-xl px-4 py-2.5 text-[13.5px] text-gray-900 outline-none focus:border-indigo-400 focus:ring-2 focus:ring-indigo-100 transition-all"
+            />
+            <div className="flex gap-2 mt-4">
+              <button onClick={() => pendingDraftName.trim() && commitSaveDraft(pendingDraftName.trim())}
+                disabled={!pendingDraftName.trim()}
+                className="flex-1 py-2.5 bg-gray-900 hover:bg-gray-800 disabled:opacity-40 disabled:cursor-not-allowed text-white rounded-xl text-[13px] font-semibold transition-colors cursor-pointer border-none">
+                Save Draft
+              </button>
+              <button onClick={() => setShowNameModal(false)}
+                className="px-4 py-2.5 bg-gray-100 hover:bg-gray-200 text-gray-600 rounded-xl text-[13px] font-medium transition-colors cursor-pointer border-none">
+                Cancel
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* ── Busy overlay ── */}
+      {(loading || draftSaving) && (
+        <div className="fixed inset-0 z-[999] bg-black/35 backdrop-blur-sm flex items-center justify-center">
+          <div className="bg-white rounded-2xl px-10 py-7 flex flex-col items-center gap-3 shadow-2xl">
+            <div className="w-9 h-9 border-[3px] border-gray-200 border-t-indigo-500 rounded-full animate-spin" />
+            <span className="text-sm font-medium text-gray-600">
+              {draftSaving ? "Saving draft…" : "Processing…"}
+            </span>
+          </div>
+        </div>
+      )}
+
+      <div className="p-7 max-w-[1440px] mx-auto font-[family-name:var(--font-dm-sans)]">
+
+        {/* Draft loaded banner */}
+        {draftBanner && (
+          <div className="flex items-center justify-between bg-indigo-50 border border-indigo-200 rounded-xl px-4 py-2.5 mb-5 text-[12.5px] text-indigo-700 font-medium">
+            <div className="flex items-center gap-2">
+              <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round">
+                <path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/>
+                <polyline points="14 2 14 8 20 8"/>
+              </svg>
+              {draftBanner}
+            </div>
+            <div className="flex items-center gap-3">
+              <button onClick={() => router.push("/drafts")}
+                className="text-indigo-500 hover:text-indigo-700 text-[11.5px] underline underline-offset-2 cursor-pointer">
+                All Drafts
+              </button>
+              <button onClick={() => setDraftBanner(null)} className="text-indigo-400 hover:text-indigo-600 cursor-pointer">
+                <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round">
+                  <line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/>
+                </svg>
+              </button>
+            </div>
+          </div>
+        )}
+
+        {/* Page heading */}
+        <div className="mb-6 flex items-start justify-between">
+          <div>
+            <h1 className="text-2xl font-bold text-gray-900 tracking-tight">Place Order</h1>
+            <p className="text-sm text-gray-500 mt-1">{docDate} · {user.Dealer_Name}</p>
+          </div>
+          <button onClick={() => router.push("/drafts")}
+            className="inline-flex items-center gap-1.5 text-[12.5px] text-gray-400 hover:text-indigo-600 border border-gray-200 hover:border-indigo-200 hover:bg-indigo-50 px-3 py-2 rounded-xl transition-all cursor-pointer bg-white">
+            <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round">
+              <path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/>
+              <polyline points="14 2 14 8 20 8"/>
+            </svg>
+            My Drafts
+          </button>
+        </div>
+
+        {/* Dealer info card */}
+        <div className="bg-white border border-gray-200 rounded-2xl p-6 mb-5">
+          <h2 className="text-lg font-bold text-gray-900 tracking-tight">{user.Dealer_Name}</h2>
+          <p className="text-xs text-gray-400 mb-5">Dealer code: {user.Dealer_Dealercode ?? "—"}</p>
+          <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-4">
+            <div className="flex flex-col gap-1.5">
+              <label className="text-[10.5px] font-bold text-gray-400 uppercase tracking-wider">Bill To</label>
+              <div className="text-[13.5px] text-gray-800 font-medium bg-gray-50 border border-gray-200 rounded-xl px-3 py-2.5 min-h-[72px] whitespace-pre-wrap">
+                {user.Dealer_Address[0].toUpperCase() + user.Dealer_Address.slice(1).toLowerCase()}
+              </div>
+            </div>
+            <div className="flex flex-col gap-1.5">
+              <label className="text-[10.5px] font-bold text-gray-400 uppercase tracking-wider">GST Number</label>
+              <div className="text-[13.5px] text-gray-800 font-medium bg-gray-50 border border-gray-200 rounded-xl px-3 py-2.5 font-mono">{user.gst}</div>
+            </div>
+            <div className="flex flex-col gap-1.5">
+              <label className="text-[10.5px] font-bold text-gray-400 uppercase tracking-wider">Ship To</label>
+              <textarea className="text-[13.5px] text-gray-800 bg-white border border-gray-200 rounded-xl px-3 py-2.5 outline-none resize-none min-h-[72px] focus:border-indigo-500 focus:ring-2 focus:ring-indigo-100 transition-all"
+                value={shipto} onChange={e => setShipto(e.target.value)} />
+            </div>
+            <div className="flex flex-col gap-1.5">
+              <label className="text-[10.5px] font-bold text-gray-400 uppercase tracking-wider">Document Date</label>
+              <div className="text-[13.5px] text-gray-800 font-medium bg-gray-50 border border-gray-200 rounded-xl px-3 py-2.5">{docDate}</div>
+            </div>
+            <div className="flex flex-col gap-1.5">
+              <label className="text-[10.5px] font-bold text-gray-400 uppercase tracking-wider">Phone</label>
+              <div className="text-[13.5px] text-gray-800 font-medium bg-gray-50 border border-gray-200 rounded-xl px-3 py-2.5 font-mono">{user.Dealer_Number}</div>
+            </div>
+            <div className="flex flex-col gap-1.5">
+              <label className="text-[10.5px] font-bold text-gray-400 uppercase tracking-wider">Email</label>
+              <div className="text-[13.5px] text-gray-800 font-medium bg-gray-50 border border-gray-200 rounded-xl px-3 py-2.5 truncate">{user.Dealer_Email}</div>
+            </div>
+            <div className="flex flex-col gap-1.5">
+              <label className="text-[10.5px] font-bold text-gray-400 uppercase tracking-wider">Customer Ref No.</label>
+              <input type="text" placeholder="Enter reference number" value={refno} onChange={e => setRefno(e.target.value)}
+                className="text-[13.5px] text-gray-800 bg-white border border-gray-200 rounded-xl px-3 py-2.5 outline-none focus:border-indigo-500 focus:ring-2 focus:ring-indigo-100 transition-all placeholder:text-gray-300" />
+            </div>
+            <div className="flex flex-col gap-1.5">
+              <label className="text-[10.5px] font-bold text-gray-400 uppercase tracking-wider">Discount Rate</label>
+              <div className={`text-[13.5px] font-semibold rounded-xl px-3 py-2.5 border flex items-center justify-between ${
+                appliedCoupon ? "text-violet-700 bg-violet-50 border-violet-200" : "text-emerald-600 bg-emerald-50 border-emerald-200"
+              }`}>
+                <span>
+                  {appliedCoupon
+                    ? <>{appliedCoupon.pct}% <span className="text-[11px] font-normal">(coupon)</span></>
+                    : <>{user.discount}% dealer discount</>}
+                </span>
+                {appliedCoupon && <span className="text-[11px] text-gray-400 line-through ml-2">{user.discount}%</span>}
+              </div>
+            </div>
+          </div>
+        </div>
+
+        {/* Coupon */}
+        <div className="bg-white border border-gray-200 rounded-2xl p-5 mb-5">
+          <div className="flex items-center gap-2 mb-3">
+            <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" className="text-violet-500">
+              <path d="M20.59 13.41l-7.17 7.17a2 2 0 0 1-2.83 0L2 12V2h10l8.59 8.59a2 2 0 0 1 0 2.82z"/><circle cx="7" cy="7" r="1"/>
+            </svg>
+            <span className="text-[13px] font-semibold text-gray-800">Special Price</span>
+            {appliedCoupon && (
+              <span className="ml-auto text-[11px] font-bold px-2.5 py-0.5 bg-violet-100 text-violet-700 rounded-full border border-violet-200">
+                {appliedCoupon.code} · {appliedCoupon.pct}% off
+              </span>
+            )}
+          </div>
+          {!appliedCoupon ? (
+            <div className="flex gap-2">
+              <input type="text" placeholder="Enter coupon code" value={couponInput}
+                onChange={e => { setCouponInput(e.target.value.toUpperCase()); setCouponError(""); setCouponSuccess(""); }}
+                onKeyDown={e => { if (e.key === "Enter") handleApplyCoupon(); }}
+                className={`flex-1 text-[13px] text-gray-900 border rounded-xl px-4 py-2.5 outline-none transition-all font-mono tracking-wider placeholder:text-gray-300 placeholder:font-normal ${
+                  couponError ? "border-red-300 bg-red-50/30 focus:ring-2 focus:ring-red-100" : "border-gray-200 focus:border-violet-400 focus:ring-2 focus:ring-violet-100"
+                }`}
+              />
+              <button onClick={handleApplyCoupon} disabled={!couponInput.trim()}
+                className="px-5 py-2.5 bg-violet-600 hover:bg-violet-700 disabled:opacity-40 disabled:cursor-not-allowed text-white text-[13px] font-semibold rounded-xl transition-colors">
+                Apply
+              </button>
+            </div>
           ) : (
-            <><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="7 10 12 15 17 10"/><line x1="12" y1="15" x2="12" y2="3"/></svg>Export</>
+            <div className="flex items-center justify-between bg-violet-50 border border-violet-200 rounded-xl px-4 py-3">
+              <div className="flex items-center gap-3">
+                <div className="w-7 h-7 rounded-full bg-violet-600 flex items-center justify-center flex-shrink-0">
+                  <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="#fff" strokeWidth="2.5" strokeLinecap="round"><path d="M20 6 9 17l-5-5"/></svg>
+                </div>
+                <div>
+                  <p className="text-[13px] font-bold text-violet-800 font-mono tracking-wider">{appliedCoupon.code}</p>
+                  <p className="text-[11px] text-violet-600 mt-0.5">{appliedCoupon.pct}% off · saving extra {appliedCoupon.pct - dealerDiscount}% over dealer rate</p>
+                </div>
+              </div>
+              <button onClick={handleRemoveCoupon}
+                className="text-[12px] font-semibold text-violet-600 hover:text-red-600 px-3 py-1.5 rounded-lg hover:bg-red-50 transition-all border border-violet-200 hover:border-red-200">
+                Remove
+              </button>
+            </div>
           )}
-        </button>
-        {showMenu && (
-          <div className="absolute right-0 mt-2 w-56 bg-white rounded-lg shadow-xl border border-gray-200 z-40 overflow-hidden">
-            <button onClick={() => handleExport(false)} disabled={isExporting} className="w-full text-left px-4 py-3 text-[13px] text-gray-700 hover:bg-blue-50 disabled:opacity-50 border-b border-gray-100 transition-colors flex items-center gap-3">
-              <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="7 10 12 15 17 10"/><line x1="12" y1="15" x2="12" y2="3"/></svg>
-              <div><p className="font-medium">Download to Device</p><p className="text-[11px] text-gray-500 mt-0.5">Save PDF locally</p></div>
+          {couponError   && <p className="text-[12px] text-red-600 mt-2 flex items-center gap-1.5"><svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round"><circle cx="12" cy="12" r="10"/><path d="M12 8v4m0 4h.01"/></svg>{couponError}</p>}
+          {couponSuccess && !appliedCoupon && <p className="text-[12px] text-emerald-600 mt-2">{couponSuccess}</p>}
+        </div>
+
+        {/* Tabs */}
+        <div className="flex gap-2 mb-5">
+          {(["manual", "excel"] as const).map(t => (
+            <button key={t} onClick={() => setTab(t)}
+              className={`px-5 py-2 rounded-xl text-[13px] font-medium border transition-all duration-150 cursor-pointer ${
+                tab === t ? "bg-gray-900 text-white border-gray-900" : "bg-white text-gray-500 border-gray-200 hover:bg-gray-50 hover:text-gray-700"
+              }`}>
+              {t === "manual" ? "Manual Entry" : "Upload Excel"}
             </button>
-            <button onClick={() => handleExport(true)} disabled={isExporting} className="w-full text-left px-4 py-3 text-[13px] text-gray-700 hover:bg-emerald-50 disabled:opacity-50 transition-colors flex items-center gap-3">
-              <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"><circle cx="12" cy="12" r="1"/><path d="M12 1v6m0 6v6M4.22 4.22l4.24 4.24m0 5.08l-4.24 4.24M19.78 4.22l-4.24 4.24m0 5.08l4.24 4.24M1 12a11 11 0 0 1 22 0 11 11 0 0 1-22 0"/></svg>
-              <div><p className="font-medium">Upload to Supabase</p><p className="text-[11px] text-gray-500 mt-0.5">Cloud storage with URL</p></div>
-            </button>
+          ))}
+        </div>
+
+        {/* ── MANUAL TAB ── */}
+        {tab === "manual" && (
+          <div className="bg-white border border-gray-200 rounded-2xl overflow-hidden">
+
+            <div className="flex items-center justify-between px-6 py-4 border-b border-gray-100">
+              <div>
+                <h3 className="text-[15px] font-semibold text-gray-900">Product List</h3>
+                <p className="text-xs text-gray-400 mt-0.5">
+                  {arr1.filter(r => r.productname).length} product{arr1.filter(r => r.productname).length !== 1 ? "s" : ""} selected
+                  {activeDraftId && <span className="ml-2 text-indigo-500 font-medium">· {draftName}</span>}
+                </p>
+              </div>
+              <div className="flex items-center gap-2">
+                {appliedCoupon && (
+                  <span className="inline-flex items-center gap-1.5 px-3 py-1 bg-violet-50 text-violet-700 border border-violet-200 rounded-full text-[11px] font-semibold">
+                    {appliedCoupon.pct}% special price applied
+                  </span>
+                )}
+                {cartItems.length > 0 && (
+                  <span className="inline-flex items-center gap-1.5 px-3 py-1 bg-emerald-50 text-emerald-700 border border-emerald-200 rounded-full text-[11px] font-semibold">
+                    <svg width="10" height="10" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round"><path d="M20 6 9 17l-5-5"/></svg>
+                    {cartItems.length} from cart
+                  </span>
+                )}
+              </div>
+            </div>
+
+            <div className="overflow-x-auto">
+              <table className="w-full text-sm">
+                <thead>
+                  <tr className="bg-gray-50 border-b border-gray-100">
+                    <th className="pl-6 pr-3 py-3 text-left text-[10px] font-bold uppercase tracking-wider text-gray-400 w-10">#</th>
+                    <th className="px-3 py-3 text-left text-[10px] font-bold uppercase tracking-wider text-gray-400 min-w-[260px]">Product</th>
+                    <th className="px-3 py-3 text-left text-[10px] font-bold uppercase tracking-wider text-gray-400 w-28">Cat. No / Variant</th>
+                    <th className="px-3 py-3 text-left text-[10px] font-bold uppercase tracking-wider text-gray-400 w-32">Quantity</th>
+                    <th className="px-3 py-3 text-left text-[10px] font-bold uppercase tracking-wider text-gray-400 w-36">Pack → Units</th>
+                    <th className="px-3 py-3 text-left text-[10px] font-bold uppercase tracking-wider text-gray-400 w-28">List Price</th>
+                    <th className={`px-3 py-3 text-left text-[10px] font-bold uppercase tracking-wider w-28 ${appliedCoupon ? "text-violet-500" : "text-gray-400"}`}>
+                      Discount ({activeDiscount}%)
+                    </th>
+                    <th className="px-3 py-3 text-left text-[10px] font-bold uppercase tracking-wider text-gray-400 w-28">Final Price</th>
+                    <th className="pl-3 pr-6 py-3 w-14"></th>
+                  </tr>
+                </thead>
+                <tbody className="divide-y divide-gray-50">
+                  {arr1.map((row, idx) => {
+                    const listPrice  = row.producQuanity * row.price;
+                    const discAmt    = Math.round(listPrice * (activeDiscount / 100));
+                    const rowTotal   = listPrice - discAmt;
+                    const totalUnits = row.producQuanity * row.packSize;
+                    const meta       = variantLookup[row.productname];
+
+                    return (
+                      <tr key={row.key} className="hover:bg-gray-50/50 transition-colors">
+                        <td className="pl-6 pr-3 py-3">
+                          <span className="text-[11px] text-gray-300 font-mono">{String(idx + 1).padStart(2, "0")}</span>
+                        </td>
+                        <td className="px-3 py-3">
+                          {row.productname && (row.displayName || meta) && (
+                            <div className="flex items-center gap-2 mb-2">
+                              {meta?.image ? (
+                                <img src={meta.image} alt={row.displayName}
+                                  className="w-8 h-8 object-contain rounded border border-gray-100 bg-gray-50 flex-shrink-0" />
+                              ) : (
+                                <div className="w-8 h-8 rounded border border-gray-100 bg-gray-50 flex-shrink-0 flex items-center justify-center">
+                                  <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="#cbd5e1" strokeWidth="1.5">
+                                    <rect x="3" y="3" width="18" height="18" rx="2"/><circle cx="8.5" cy="8.5" r="1.5"/><path d="m21 15-5-5L5 21"/>
+                                  </svg>
+                                </div>
+                              )}
+                              <p className="text-[12px] font-semibold text-gray-800 truncate leading-tight">
+                                {row.displayName || meta?.productName || row.productname}
+                              </p>
+                            </div>
+                          )}
+                          <Select
+                            options={optionList}
+                            placeholder="Search and select product…"
+                            value={getSelectValue(row)}
+                            onChange={opt => opt && handleChangeSelect(opt, idx)}
+                            isSearchable
+                            styles={selectStyles}
+                            menuPortalTarget={mounted ? document.body : undefined}
+                            menuPosition="fixed"
+                          />
+                        </td>
+                        <td className="px-3 py-3">
+                          {row.variantCode ? (
+                            <span className="inline-flex items-center px-2 py-1 bg-amber-50 border border-amber-200 text-amber-700 rounded-lg text-[11px] font-mono font-semibold whitespace-nowrap">
+                              {row.variantCode}
+                            </span>
+                          ) : <span className="text-gray-300 text-[11px]">—</span>}
+                        </td>
+                        <td className="px-3 py-3">
+                          <div className="flex items-center border border-gray-200 rounded-xl overflow-hidden w-fit">
+                            <button onClick={() => updateQuantity(idx, row.producQuanity - 1)}
+                              className="w-8 h-[34px] flex items-center justify-center bg-gray-50 hover:bg-gray-100 text-gray-600 text-base transition-colors border-none cursor-pointer">−</button>
+                            <input type="number" value={row.producQuanity} onChange={e => updateQuantity(idx, parseInt(e.target.value) || 1)} min={1}
+                              className="w-12 h-[34px] text-center text-[13px] font-semibold text-gray-900 font-mono border-x border-gray-200 outline-none bg-white" />
+                            <button onClick={() => updateQuantity(idx, row.producQuanity + 1)}
+                              className="w-8 h-[34px] flex items-center justify-center bg-gray-50 hover:bg-gray-100 text-gray-600 text-base transition-colors border-none cursor-pointer">+</button>
+                          </div>
+                          <p className="text-[10px] text-gray-400 mt-1 font-mono">{row.producQuanity} pack{row.producQuanity !== 1 ? "s" : ""}</p>
+                        </td>
+                        <td className="px-3 py-3">
+                          {row.packSize > 1 ? (
+                            <div className="flex items-center gap-1.5 flex-wrap">
+                              <span className="inline-flex items-center gap-1 px-2 py-0.5 bg-amber-50 border border-amber-200 text-amber-700 rounded text-[11px] font-semibold font-mono">
+                                {row.producQuanity} × {row.packSize}
+                              </span>
+                              <span className="text-gray-300 text-xs">=</span>
+                              <span className="inline-flex items-center px-2 py-0.5 bg-indigo-50 border border-indigo-200 text-indigo-700 rounded text-[11px] font-bold font-mono">
+                                {totalUnits} units
+                              </span>
+                            </div>
+                          ) : (
+                            <span className="inline-flex items-center px-2 py-0.5 bg-gray-50 border border-gray-200 text-gray-500 rounded text-[11px] font-mono">
+                              {totalUnits} unit{totalUnits !== 1 ? "s" : ""}
+                            </span>
+                          )}
+                        </td>
+                        <td className="px-3 py-3">
+                          <span className="font-mono text-[13px] text-gray-600 font-semibold">
+                            {listPrice > 0 ? fmt(listPrice) : "—"}
+                          </span>
+                          {listPrice > 0 && <p className="text-[10px] text-gray-400 mt-0.5">{fmt(row.price)} × {row.producQuanity}</p>}
+                        </td>
+                        <td className="px-3 py-3">
+                          <span className={`font-mono text-[12px] font-semibold ${appliedCoupon ? "text-violet-600" : "text-amber-500"}`}>
+                            {discAmt > 0 ? `−${fmt(discAmt)}` : "—"}
+                          </span>
+                          {discAmt > 0 && <p className="text-[10px] text-gray-400 mt-0.5">{activeDiscount}% off</p>}
+                        </td>
+                        <td className="px-3 py-3">
+                          {listPrice > 0 && discAmt > 0 && (
+                            <span className="block font-mono text-[11px] text-gray-400 line-through">{fmt(listPrice)}</span>
+                          )}
+                          <span className={`font-mono text-[13px] font-semibold ${appliedCoupon ? "text-violet-700" : "text-emerald-600"}`}>
+                            {rowTotal > 0 ? fmt(rowTotal) : "—"}
+                          </span>
+                        </td>
+                        <td className="pl-3 pr-6 py-3">
+                          <button onClick={() => removeRow(row.key)} title="Remove row"
+                            className="w-[30px] h-[30px] flex items-center justify-center rounded-lg border border-red-100 text-red-400 hover:bg-red-50 hover:border-red-200 transition-colors cursor-pointer bg-transparent">
+                            <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round">
+                              <polyline points="3 6 5 6 21 6"/><path d="M19 6l-1 14H6L5 6m5 0V4h4v2"/>
+                            </svg>
+                          </button>
+                        </td>
+                      </tr>
+                    );
+                  })}
+                  <tr className="border-t border-dashed border-gray-100">
+                    <td colSpan={9} className="px-6 py-3">
+                      <button onClick={addRow}
+                        className="inline-flex items-center gap-2 text-[12px] text-gray-400 hover:text-indigo-600 transition-colors cursor-pointer">
+                        <span className="w-5 h-5 rounded-md border border-gray-200 flex items-center justify-center text-sm hover:border-indigo-300 hover:bg-indigo-50 transition-colors">+</span>
+                        Add another product
+                      </button>
+                    </td>
+                  </tr>
+                </tbody>
+              </table>
+            </div>
+
+            {/* ── Reward Banner — live preview ── */}
+            <RewardBanner
+              grandTotalPaise={grandTotal}
+              dealerId={String(user.Dealer_Id)}
+            />
+
+            {/* Totals bar */}
+            <div className={`flex items-center justify-between px-6 py-4 border-t border-gray-100 ${appliedCoupon ? "bg-violet-50/50" : "bg-gray-50"}`}>
+              <div>
+                <p className="text-[13px] text-gray-500">Order Total</p>
+                <p className="text-[11px] text-gray-400 mt-0.5 font-mono">
+                  {arr1.reduce((a, r) => a + r.producQuanity, 0)} packs ·{" "}
+                  {arr1.filter(r => r.productname).length} product{arr1.filter(r => r.productname).length !== 1 ? "s" : ""}
+                  {appliedCoupon && <span className="ml-2 text-violet-600 font-semibold">· {appliedCoupon.code} applied</span>}
+                </p>
+                {appliedCoupon && grandTotalWithoutCoupon !== null && (
+                  <p className="text-[11px] text-violet-600 font-semibold mt-1">
+                    You save {fmt(grandTotalWithoutCoupon - grandTotal)} extra with this coupon
+                  </p>
+                )}
+              </div>
+              <div className="text-right">
+                {appliedCoupon && grandTotalWithoutCoupon !== null && (
+                  <p className="text-[13px] font-mono text-gray-400 line-through mb-0.5">{fmt(grandTotalWithoutCoupon)}</p>
+                )}
+                <p className={`text-[22px] font-bold font-mono tracking-tight ${appliedCoupon ? "text-violet-700" : "text-gray-900"}`}>
+                  {fmt(grandTotal)}
+                </p>
+              </div>
+            </div>
+
+            {/* Action bar */}
+            <div className="flex items-center gap-3 px-6 py-4 border-t border-gray-100 flex-wrap">
+              <button onClick={handleSubmitProductArray}
+                className={`inline-flex items-center gap-2 px-5 py-2.5 text-white rounded-xl text-[13.5px] font-semibold transition-all shadow-sm hover:shadow-md hover:-translate-y-px cursor-pointer border-none ${
+                  appliedCoupon
+                    ? "bg-gradient-to-r from-violet-600 to-violet-500 hover:from-violet-700 hover:to-violet-600"
+                    : "bg-gradient-to-r from-emerald-600 to-emerald-500 hover:from-emerald-700 hover:to-emerald-600"
+                }`}>
+                <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round"><path d="M20 6 9 17l-5-5"/></svg>
+                Place Order
+              </button>
+              <button onClick={handleSaveDraft} disabled={draftSaving}
+                className="inline-flex items-center gap-2 px-4 py-2.5 bg-white border border-gray-200 hover:bg-indigo-50 hover:border-indigo-300 hover:text-indigo-700 text-gray-600 rounded-xl text-[13.5px] font-medium transition-all cursor-pointer disabled:opacity-40 disabled:cursor-not-allowed">
+                <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round">
+                  <path d="M19 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h11l5 5v11a2 2 0 0 1-2 2z"/>
+                  <polyline points="17 21 17 13 7 13 7 21"/><polyline points="7 3 7 8 15 8"/>
+                </svg>
+                {activeDraftId ? "Update Draft" : "Save as Draft"}
+              </button>
+              <button onClick={addRow}
+                className="inline-flex items-center gap-2 px-4 py-2.5 bg-white border border-gray-200 hover:bg-gray-50 hover:border-gray-300 text-gray-600 rounded-xl text-[13.5px] font-medium transition-all cursor-pointer">
+                <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round"><path d="M12 5v14M5 12h14"/></svg>
+                Add Row
+              </button>
+            </div>
+          </div>
+        )}
+
+        {/* ── EXCEL TAB ── */}
+        {tab === "excel" && (
+          <div className="bg-white border border-gray-200 rounded-2xl p-7">
+            <h3 className="text-[15px] font-semibold text-gray-900 mb-1">Upload Excel File</h3>
+            <p className="text-[13px] text-gray-400 mb-6">Place orders in bulk using a formatted Excel spreadsheet.</p>
+            <form onSubmit={handleSubmitFile}>
+              <label className={`block border-2 border-dashed rounded-2xl p-10 text-center cursor-pointer transition-all duration-200 ${
+                file ? "border-emerald-300 bg-emerald-50" : "border-gray-200 hover:border-indigo-300 hover:bg-indigo-50/30"
+              }`}>
+                <input required type="file" accept=".xlsx,.xls,.csv" className="hidden"
+                  onChange={e => setFile(e.target.files?.[0] ?? null)} />
+                {file ? (
+                  <><div className="text-4xl mb-3">📄</div>
+                  <p className="text-[14px] font-semibold text-emerald-700 mb-1">{file.name}</p>
+                  <p className="text-[12px] text-gray-400">{(file.size / 1024).toFixed(1)} KB · Click to change</p></>
+                ) : (
+                  <><div className="text-4xl mb-3">📂</div>
+                  <p className="text-[14px] font-semibold text-gray-700 mb-1">Click to upload Excel file</p>
+                  <p className="text-[12px] text-gray-400">.xlsx, .xls, .csv accepted</p></>
+                )}
+              </label>
+              <div className="mt-5">
+                <button type="submit" disabled={!file}
+                  className="inline-flex items-center gap-2 px-5 py-2.5 bg-gray-900 hover:bg-gray-800 disabled:bg-gray-200 disabled:text-gray-400 disabled:cursor-not-allowed text-white rounded-xl text-[13.5px] font-semibold transition-all cursor-pointer border-none">
+                  <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round">
+                    <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4M17 8l-5-5-5 5M12 3v12"/>
+                  </svg>
+                  Submit via Excel
+                </button>
+              </div>
+            </form>
           </div>
         )}
       </div>
-      {showNotification && (
-        <div className={`fixed bottom-4 right-4 px-4 py-3 rounded-lg text-[13px] font-medium shadow-lg animate-in fade-in slide-in-from-bottom z-50 flex items-center gap-2 ${
-          showNotification.type === "success" ? "bg-emerald-50 text-emerald-800 border border-emerald-200" : "bg-red-50 text-red-800 border border-red-200"
-        }`}>
-          {showNotification.type === "success"
-            ? <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"><polyline points="20 6 9 17 4 12"/></svg>
-            : <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"><circle cx="12" cy="12" r="10"/><line x1="12" y1="8" x2="12" y2="12"/><line x1="12" y1="16" x2="12.01" y2="16"/></svg>
-          }
-          {showNotification.message}
-        </div>
-      )}
     </>
   );
 }
 
-// ─── Delete Modal ─────────────────────────────────────────────────────────────
-function DeleteModal({ orderId, onConfirm, onClose }: { orderId: string; onConfirm: (reason: string) => Promise<void>; onClose: () => void }) {
-  const [reason, setReason] = useState("");
-  const [deleting, setDeleting] = useState(false);
-  const [err, setErr] = useState("");
-
-  const submit = async () => {
-    if (!reason.trim()) { setErr("A reason is required."); return; }
-    setDeleting(true);
-    await onConfirm(reason.trim());
-    setDeleting(false);
-  };
-
+export default function AddOrderPage() {
   return (
-    <div
-      className="fixed inset-0 z-50 flex items-center justify-center p-4"
-      style={{ backdropFilter: "blur(8px)", background: "rgba(15,23,42,0.45)" }}
-      onClick={e => { if (e.target === e.currentTarget && !deleting) onClose(); }}
-    >
-      <div className="bg-white rounded-2xl shadow-2xl w-full max-w-md" style={{ animation: "slideUp 0.2s ease" }}>
-        <div className="px-6 pt-6 pb-4 border-b border-gray-100">
-          <div className="w-10 h-10 rounded-full bg-red-50 border border-red-100 flex items-center justify-center mb-3">
-            <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="#ef4444" strokeWidth="2" strokeLinecap="round">
-              <polyline points="3 6 5 6 21 6"/><path d="M19 6l-1 14H6L5 6m5 0V4h4v2"/>
-            </svg>
-          </div>
-          <h3 className="text-[15px] font-bold text-gray-900">Delete Order #{orderId}?</h3>
-          <p className="text-[13px] text-gray-600 mt-1">Order stays in history with your reason. This cannot be undone.</p>
-        </div>
-        <div className="px-6 py-4">
-          <label className="text-[11px] font-bold text-gray-600 uppercase tracking-widest block mb-2">
-            Reason <span className="text-red-500">*</span>
-          </label>
-          <textarea
-            value={reason}
-            onChange={e => { setReason(e.target.value); setErr(""); }}
-            placeholder="e.g. Duplicate order, wrong items, customer cancelled…"
-            rows={3}
-            disabled={deleting}
-            className={`w-full px-4 py-3 text-[13px] text-gray-900 border rounded-xl outline-none resize-none transition-all placeholder:text-gray-400 ${
-              err ? "border-red-300 bg-red-50/30 focus:ring-2 focus:ring-red-100" : "border-gray-200 focus:border-indigo-400 focus:ring-2 focus:ring-indigo-100"
-            }`}
-          />
-          {err && <p className="text-[11px] text-red-600 mt-1.5">{err}</p>}
-        </div>
-        <div className="px-6 pb-6 flex gap-2">
-          <button onClick={onClose} disabled={deleting} className="flex-1 py-2.5 border border-gray-200 rounded-xl text-[13px] font-medium text-gray-700 hover:bg-gray-50 disabled:opacity-50 transition-colors">Cancel</button>
-          <button onClick={submit} disabled={deleting || !reason.trim()} className="flex-1 py-2.5 bg-red-500 hover:bg-red-600 disabled:opacity-50 disabled:cursor-not-allowed text-white rounded-xl text-[13px] font-semibold transition-colors flex items-center justify-center gap-2">
-            {deleting && <div className="w-3.5 h-3.5 border-2 border-white border-t-transparent rounded-full animate-spin" />}
-            {deleting ? "Deleting…" : "Delete Order"}
-          </button>
-        </div>
-      </div>
-    </div>
-  );
-}
-
-// ─── Main ─────────────────────────────────────────────────────────────────────
-export default function OrderHistoryPage() {
-  const router = useRouter();
-  const [page, setPage] = useState(1);
-  const [search, setSearch] = useState("");
-  const [query, setQuery] = useState("");
-  const [dealerId, setDealerId] = useState("225");
-  const [year] = useState(new Date().getFullYear());
-  const [deleteOrderId, setDeleteOrderId] = useState<string | null>(null);
-  const [showInvoiceModal, setShowInvoiceModal] = useState(false);
-
-  useEffect(() => { setDealerId(getDealerId()); }, []);
-
-  const { data, isLoading, isError, isFetching, refetch } = useQuery({
-    queryKey: ["orders", page, query, dealerId],
-    queryFn: () => fetchOrders(page, query, dealerId),
-    placeholderData: keepPreviousData,
-    staleTime: 30_000,
-    enabled: !!dealerId,
-  });
-
-  const orders = data?.data ?? [];
-  const totalCount = data?.count ?? 0;
-  const totalPages = Math.ceil(totalCount / PAGE_SIZE);
-
-  const handleSearch = (e: React.FormEvent) => { e.preventDefault(); setQuery(search); setPage(1); };
-
-  const handleDelete = async (reason: string) => {
-    if (!deleteOrderId) return;
-    const fd = new FormData();
-    fd.append("id", deleteOrderId);
-    fd.append("reason", reason);
-    fd.append("field", "order_id");
-    fd.append("tbl", "order_tbl");
-    await fetch(`${BACKEND}/deletewithreason`, { method: "POST", body: fd });
-    setDeleteOrderId(null);
-    refetch();
-  };
-
-  const pageNums = Array.from({ length: totalPages }, (_, i) => i + 1)
-    .filter(p => p === 1 || p === totalPages || Math.abs(p - page) <= 1)
-    .reduce<(number | "…")[]>((acc, p, i, arr) => {
-      if (i > 0 && p - (arr[i - 1] as number) > 1) acc.push("…");
-      acc.push(p); return acc;
-    }, []);
-
-  return (
-    <>
-      <style>{`
-        @keyframes slideUp {
-          from { transform: translateY(12px) scale(0.97); opacity: 0; }
-          to   { transform: translateY(0) scale(1); opacity: 1; }
-        }
-      `}</style>
-
-      <div className="min-h-screen bg-gray-50" style={{ fontFamily: "'DM Sans','Helvetica Neue',sans-serif" }}>
-
-        {/* Header */}
-        <div className="bg-white border-b border-gray-200 px-8 py-5 flex items-center justify-between sticky top-0 z-20">
-          <div className="flex items-center gap-2">
-            <button
-              onClick={() => router.back()}
-              className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-lg border border-[#e2e8f0] bg-[#f8fafc] text-[12.5px] font-medium text-[#374151] cursor-pointer transition-all hover:bg-[#f1f5f9] hover:-translate-x-px"
-            >
-              back
-            </button>
-            <h1 className="text-xl font-bold text-gray-900">Order History</h1>
-            <p className="text-sm text-gray-600 mt-0.5">
-              {isLoading ? "Loading…" : `${totalCount} total orders`}
-              {isFetching && !isLoading && (
-                <span className="ml-2 inline-flex items-center gap-1 text-indigo-600 text-[11px]">
-                  <span className="w-1.5 h-1.5 rounded-full bg-indigo-500 animate-ping inline-block" />
-                  refreshing
-                </span>
-              )}
-            </p>
-          </div>
-          <div className="flex items-center gap-3">
-            <form onSubmit={handleSearch} className="flex items-center gap-2">
-              <div className="relative">
-                <svg className="absolute left-3 top-1/2 -translate-y-1/2 text-gray-400" width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round">
-                  <circle cx="11" cy="11" r="8" /><path d="m21 21-4.35-4.35" />
-                </svg>
-                <input value={search} onChange={e => setSearch(e.target.value)} placeholder="Search orders…"
-                  className="pl-9 pr-4 py-2 text-[13px] text-gray-900 border border-gray-200 rounded-xl bg-gray-50 outline-none focus:bg-white focus:border-indigo-400 focus:ring-2 focus:ring-indigo-100 transition-all w-52 placeholder:text-gray-400" />
-              </div>
-              <button type="submit" className="px-4 py-2 bg-gray-900 text-white text-[13px] font-semibold rounded-xl hover:bg-gray-700 transition-colors">Search</button>
-              {query && (
-                <button type="button" onClick={() => { setSearch(""); setQuery(""); setPage(1); }}
-                  className="px-3 py-2 text-[13px] text-gray-600 hover:text-gray-900 border border-gray-200 rounded-xl transition-colors">Clear</button>
-              )}
-            </form>
-
-            <button
-              onClick={() => setShowInvoiceModal(true)}
-              className="flex items-center gap-2 px-4 py-2 bg-blue-600 hover:bg-blue-700 text-white text-[13px] font-semibold rounded-xl transition-colors"
-            >
-              <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
-                <path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z" />
-                <polyline points="14 2 14 8 20 8" />
-                <line x1="16" y1="13" x2="8" y2="13" />
-                <line x1="16" y1="17" x2="8" y2="17" />
-              </svg>
-              Invoices
-            </button>
-
-            <ExportButton
-              orders={orders}
-              dealerName={data?.data?.[0]?.Dealer_Name || "Unknown"}
-              dealerId={dealerId}
-              isLoading={isLoading}
-            />
-          </div>
-        </div>
-
-        <div className="px-8 py-6 max-w-[1440px] mx-auto">
-          <div className="bg-white border border-gray-200 rounded-2xl overflow-hidden shadow-sm">
-
-            {isError && (
-              <div className="flex flex-col items-center justify-center py-20 gap-3">
-                <svg width="32" height="32" viewBox="0 0 24 24" fill="none" stroke="#9ca3af" strokeWidth="1.5" strokeLinecap="round">
-                  <circle cx="12" cy="12" r="10" /><path d="M12 8v4m0 4h.01" />
-                </svg>
-                <p className="text-sm text-gray-600">Failed to load orders. Please try again.</p>
-              </div>
-            )}
-
-            {!isError && (
-              <div className="overflow-x-auto">
-                <table className="w-full text-sm">
-                  <thead>
-                    <tr className="bg-gray-50 border-b border-gray-200">
-                      {["#", "Order No.", "Date", "Gross", "Discount", "Net", "Units", "Outstanding", "Actions"].map(h => (
-                        <th key={h} className="px-4 py-3.5 text-left text-[11px] font-bold uppercase tracking-wider text-gray-600 whitespace-nowrap">{h}</th>
-                      ))}
-                    </tr>
-                  </thead>
-                  <tbody className="divide-y divide-gray-100">
-                    {isLoading
-                      ? Array.from({ length: 8 }).map((_, i) => <SkeletonRow key={i} />)
-                      : orders.length === 0
-                        ? (
-                          <tr><td colSpan={10}>
-                            <div className="flex flex-col items-center justify-center py-16 gap-3">
-                              <svg width="40" height="40" viewBox="0 0 24 24" fill="none" stroke="#d1d5db" strokeWidth="1.2" strokeLinecap="round">
-                                <path d="M9 5H7a2 2 0 0 0-2 2v12a2 2 0 0 0 2 2h10a2 2 0 0 0 2-2V7a2 2 0 0 0-2-2h-2" />
-                                <rect x="9" y="3" width="6" height="4" rx="1" />
-                              </svg>
-                              <p className="text-sm text-gray-600">No orders found</p>
-                            </div>
-                          </td></tr>
-                        )
-                        : orders.map((order, idx) => {
-                          const net = Number(order.order_amount) - Number(order.order_discount);
-                          const isDeleted = !!(order.reason);
-
-                          return (
-                            <tr key={order.order_id} className={`hover:bg-blue-50/30 transition-colors ${isDeleted ? "opacity-60" : ""}`}>
-                              <td className="px-4 py-3.5 text-gray-700 font-medium">
-                                {String((page - 1) * PAGE_SIZE + idx + 1).padStart(2, "0")}
-                              </td>
-                              <td className="px-4 py-3.5">
-                                <div className="flex items-center gap-2">
-                                  <span className="font-mono text-[13px] font-bold text-indigo-700">
-                                    OM/{year}/{order.order_id}
-                                  </span>
-                                  {isDeleted && (
-                                    <span className="px-1.5 py-0.5 bg-red-50 border border-red-200 text-red-700 rounded text-[10px] font-bold">DELETED</span>
-                                  )}
-                                </div>
-                              </td>
-                              <td className="px-4 py-3.5">
-                                <p className="text-[13px] text-gray-900 font-medium">{moment(order.order_date).format("DD MMM YYYY")}</p>
-                                <p className="text-[11px] text-gray-600 font-mono mt-0.5">{moment(order.order_date).format("hh:mm A")}</p>
-                              </td>
-                              <td className="px-4 py-3.5 font-mono text-[13px] text-gray-700 line-through">
-                                ₹{Number(order.order_amount).toLocaleString("en-IN")}
-                              </td>
-                              <td className="px-4 py-3.5 font-mono text-[13px] text-amber-700">
-                                −₹{Number(order.order_discount).toLocaleString("en-IN")}
-                              </td>
-                              <td className="px-4 py-3.5 font-mono text-[14px] font-bold text-gray-900">
-                                ₹{net.toLocaleString("en-IN")}
-                              </td>
-                              <td className="px-4 py-3.5">
-                                <span className="px-2 py-0.5 bg-gray-100 text-gray-800 rounded-lg text-[12px] font-mono font-semibold">
-                                  {order.orderdata_item_quantity} units
-                                </span>
-                              </td>
-                              {/* <td className="px-4 py-3.5">
-                                <MtStatusBadge status={order.mtstatus} />
-                              </td> */}
-                              <td className="px-4 py-3.5 font-mono text-[12px] text-gray-700">
-                                {order.outstandingDate ? moment(order.outstandingDate).format("DD MMM YYYY") : "—"}
-                              </td>
-
-                              {/* Actions — always visible, no hover gate */}
-                              <td className="px-4 py-3.5 w-px whitespace-nowrap">
-                                <div className="flex items-center gap-1.5">
-                                  <button
-                                    onClick={() => router.push(`/orders/${order.order_id}`)}
-                                    title="View order detail"
-                                    className="flex items-center gap-1.5 px-2.5 py-1.5 bg-white border border-gray-200 hover:border-indigo-300 hover:bg-indigo-50 text-gray-700 hover:text-indigo-700 rounded-lg text-[11px] font-semibold transition-all shadow-sm"
-                                  >
-                                    <svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round">
-                                      <path d="M1 12s4-8 11-8 11 8 11 8-4 8-11 8-11-8-11-8z" />
-                                      <circle cx="12" cy="12" r="3" />
-                                    </svg>
-                                    View
-                                  </button>
-
-                                  {/* Invoice button — always present */}
-                                  <InvoiceRowButton order={order} />
-
-                                  {!isDeleted && (
-                                    <button
-                                      onClick={() => setDeleteOrderId(order.order_id)}
-                                      title="Delete order"
-                                      className="flex items-center gap-1.5 px-2.5 py-1.5 bg-white border border-gray-200 hover:border-red-300 hover:bg-red-50 text-gray-700 hover:text-red-700 rounded-lg text-[11px] font-semibold transition-all shadow-sm"
-                                    >
-                                      <svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round">
-                                        <polyline points="3 6 5 6 21 6" />
-                                        <path d="M19 6l-1 14H6L5 6m5 0V4h4v2" />
-                                      </svg>
-                                      Delete
-                                    </button>
-                                  )}
-                                </div>
-                              </td>
-                            </tr>
-                          );
-                        })
-                    }
-                  </tbody>
-                </table>
-              </div>
-            )}
-
-            {!isLoading && !isError && totalPages > 1 && (
-              <div className="flex items-center justify-between px-6 py-4 border-t border-gray-100 bg-gray-50">
-                <p className="text-[13px] text-gray-700 font-medium">
-                  Page {page} of {totalPages} · <span className="text-gray-600">{totalCount} orders</span>
-                </p>
-                <div className="flex items-center gap-1">
-                  <button onClick={() => setPage(p => Math.max(1, p - 1))} disabled={page === 1}
-                    className="w-8 h-8 flex items-center justify-center rounded-lg border border-gray-200 text-gray-700 hover:bg-white disabled:opacity-30 disabled:cursor-not-allowed transition-all font-medium">‹</button>
-                  {pageNums.map((p, i) => p === "…"
-                    ? <span key={`d${i}`} className="w-8 h-8 flex items-center justify-center text-gray-500 text-[13px]">…</span>
-                    : <button key={p} onClick={() => setPage(p as number)}
-                      className={`w-8 h-8 flex items-center justify-center rounded-lg text-[13px] font-semibold border transition-all ${page === p ? "bg-gray-900 text-white border-gray-900" : "border-gray-200 text-gray-700 hover:bg-white"}`}>{p}</button>
-                  )}
-                  <button onClick={() => setPage(p => Math.min(totalPages, p + 1))} disabled={page === totalPages}
-                    className="w-8 h-8 flex items-center justify-center rounded-lg border border-gray-200 text-gray-700 hover:bg-white disabled:opacity-30 disabled:cursor-not-allowed transition-all font-medium">›</button>
-                </div>
-              </div>
-            )}
-          </div>
-        </div>
-      </div>
-
-      {deleteOrderId && (
-        <DeleteModal orderId={deleteOrderId} onConfirm={handleDelete} onClose={() => setDeleteOrderId(null)} />
-      )}
-
-      <InvoiceModal
-        dealerId={dealerId}
-        isOpen={showInvoiceModal}
-        onClose={() => setShowInvoiceModal(false)}
-      />
-    </>
+    <Suspense fallback={<div className="flex items-center justify-center h-[60vh] text-gray-400 text-sm">Loading…</div>}>
+      <AddOrderPageInner />
+    </Suspense>
   );
 }
