@@ -2,7 +2,7 @@
 // Lightweight auth helpers for the accountant JWT flow (Node.js backend)
 
 export const ACCOUNTANT_API =
-  process.env.NEXT_PUBLIC_ACCOUNTANT_API_URL || "http://localhost:3001";
+  process.env.NEXT_PUBLIC_ACCOUNTANT_API_URL || "/api";
 
 // ── Token helpers ─────────────────────────────────────────────────────────────
 

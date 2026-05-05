@@ -81,6 +81,39 @@ function ConfirmDelete({
   );
 }
 
+// ─── Field ────────────────────────────────────────────────────────────────────
+function Field({
+  id, label, type = "text", value, onChange, error, placeholder, suffix, disabled,
+}: {
+  id: string; label: string; type?: string; value: string;
+  onChange: (e: React.ChangeEvent<HTMLInputElement>) => void;
+  error?: string; placeholder?: string;
+  suffix?: React.ReactNode;
+  disabled?: boolean;
+}) {
+  return (
+    <div>
+      <label className="text-[11px] font-bold text-gray-500 uppercase tracking-widest block mb-1.5">{label}</label>
+      <div className="relative">
+        <input
+          id={id} type={type} value={value} onChange={onChange}
+          placeholder={placeholder}
+          disabled={disabled}
+          className={`w-full px-3.5 py-2.5 text-[13px] text-gray-900 border rounded-xl outline-none transition-all placeholder:text-gray-300 disabled:opacity-60 ${
+            error
+              ? "border-red-300 bg-red-50/30 focus:ring-2 focus:ring-red-100"
+              : "border-gray-200 focus:border-indigo-400 focus:ring-2 focus:ring-indigo-100"
+          } ${suffix ? "pr-10" : ""}`}
+        />
+        {suffix && (
+          <span className="absolute right-3 top-1/2 -translate-y-1/2">{suffix}</span>
+        )}
+      </div>
+      {error && <p className="text-[11px] text-red-500 mt-1">{error}</p>}
+    </div>
+  );
+}
+
 // ─── Accountant Form Modal ────────────────────────────────────────────────────
 function AccountantModal({
   mode,
@@ -122,35 +155,6 @@ function AccountantModal({
     await onSubmit(form);
   };
 
-  const Field = ({
-    id, label, type = "text", value, onChange, error, placeholder, suffix,
-  }: {
-    id: string; label: string; type?: string; value: string;
-    onChange: (e: React.ChangeEvent<HTMLInputElement>) => void;
-    error?: string; placeholder?: string;
-    suffix?: React.ReactNode;
-  }) => (
-    <div>
-      <label className="text-[11px] font-bold text-gray-500 uppercase tracking-widest block mb-1.5">{label}</label>
-      <div className="relative">
-        <input
-          id={id} type={type} value={value} onChange={onChange}
-          placeholder={placeholder}
-          disabled={busy}
-          className={`w-full px-3.5 py-2.5 text-[13px] text-gray-900 border rounded-xl outline-none transition-all placeholder:text-gray-300 disabled:opacity-60 ${
-            error
-              ? "border-red-300 bg-red-50/30 focus:ring-2 focus:ring-red-100"
-              : "border-gray-200 focus:border-indigo-400 focus:ring-2 focus:ring-indigo-100"
-          } ${suffix ? "pr-10" : ""}`}
-        />
-        {suffix && (
-          <span className="absolute right-3 top-1/2 -translate-y-1/2">{suffix}</span>
-        )}
-      </div>
-      {error && <p className="text-[11px] text-red-500 mt-1">{error}</p>}
-    </div>
-  );
-
   return (
     <div
       className="fixed inset-0 z-50 flex items-center justify-center p-4"
@@ -182,10 +186,10 @@ function AccountantModal({
         {/* Body */}
         <form onSubmit={handleSubmit} className="px-6 py-5 space-y-4">
           <Field id="name" label="Full Name" value={form.name} onChange={set("name")}
-            error={errors.name} placeholder="e.g. Priya Sharma" />
+            error={errors.name} placeholder="e.g. Priya Sharma" disabled={busy} />
 
           <Field id="email" label="Email" type="email" value={form.email} onChange={set("email")}
-            error={errors.email} placeholder="accountant@omsons.com" />
+            error={errors.email} placeholder="accountant@omsons.com" disabled={busy} />
 
           <Field
             id="password"
@@ -194,6 +198,7 @@ function AccountantModal({
             value={form.password} onChange={set("password")}
             error={errors.password}
             placeholder={mode === "create" ? "Min 6 characters" : "Leave blank to keep current"}
+            disabled={busy}
             suffix={
               <button type="button" onClick={() => setShowPw(v => !v)}
                 className="text-gray-400 hover:text-gray-600 transition-colors">
@@ -203,7 +208,7 @@ function AccountantModal({
           />
 
           <Field id="phone" label="Phone" type="tel" value={form.phone} onChange={set("phone")}
-            error={errors.phone} placeholder="+91 98765 43210" />
+            error={errors.phone} placeholder="+91 98765 43210" disabled={busy} />
 
           {/* Actions */}
           <div className="flex gap-2 pt-2">
